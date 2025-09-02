@@ -11,9 +11,23 @@ from torch.utils.data import Subset
 from torchvision import datasets, transforms
 from torch.utils.data import Dataset
 
-from torchtext.datasets import AG_NEWS, IMDB, SogouNews
-from torchtext.data.utils import get_tokenizer
-from torchtext.vocab import build_vocab_from_iterator
+# TorchText is only required for NLP datasets.  Import it lazily so that
+# computer-vision experiments do not require the heavy dependency.
+try:  # pragma: no cover - optional dependency
+    from torchtext.datasets import AG_NEWS, IMDB, SogouNews  # type: ignore
+    from torchtext.data.utils import get_tokenizer  # type: ignore
+    from torchtext.vocab import build_vocab_from_iterator  # type: ignore
+    TORCHTEXT_AVAILABLE = True
+except Exception:  # torchtext not installed or fails to load
+    AG_NEWS = IMDB = SogouNews = None  # type: ignore
+    TORCHTEXT_AVAILABLE = False
+
+    def get_tokenizer(*args, **kwargs):  # pragma: no cover - safety wrapper
+        raise RuntimeError("torchtext is required for NLP datasets")
+
+    def build_vocab_from_iterator(*args, **kwargs):  # pragma: no cover
+        raise RuntimeError("torchtext is required for NLP datasets")
+
 import matplotlib.pyplot as plt
 
 nlp_datasets = ["agnews", "imdb", "sogou"]
@@ -213,6 +227,8 @@ def get_dataset(args):
             ]
         )
     elif args.dataset == "agnews":
+        if not TORCHTEXT_AVAILABLE:
+            raise RuntimeError("torchtext is required for NLP datasets")
         tokenizer = get_tokenizer("basic_english")
         data = []
         train_data, test_data = list(AG_NEWS(root=".", split="train")), list(AG_NEWS(root=".", split="test"))
@@ -224,10 +240,11 @@ def get_dataset(args):
             for _, text in data_iter:
                 yield tokenizer(text)
 
-
         vocab = build_vocab_from_iterator(yield_tokens(iter(data)), specials=["<unk>"])
         vocab.set_default_index(vocab["<unk>"])
     elif args.dataset == 'imdb':
+        if not TORCHTEXT_AVAILABLE:
+            raise RuntimeError("torchtext is required for NLP datasets")
         tokenizer = get_tokenizer("basic_english")
         data = []
         train_data, test_data = list(IMDB(root=".", split="train")), list(IMDB(root=".", split="test"))
@@ -239,10 +256,11 @@ def get_dataset(args):
             for _, text in data_iter:
                 yield tokenizer(text)
 
-
         vocab = build_vocab_from_iterator(yield_tokens(iter(data)), specials=["<unk>"], max_tokens=131072)
         vocab.set_default_index(vocab["<unk>"])
     elif args.dataset == 'sogou':
+        if not TORCHTEXT_AVAILABLE:
+            raise RuntimeError("torchtext is required for NLP datasets")
         tokenizer = get_tokenizer("basic_english")
         data = []
         train_data, test_data = list(SogouNews(root=".", split="train")), list(SogouNews(root=".", split="test"))
@@ -253,7 +271,6 @@ def get_dataset(args):
         def yield_tokens(data_iter):
             for _, text in data_iter:
                 yield tokenizer(text)
-
 
         vocab = build_vocab_from_iterator(yield_tokens(iter(data)), specials=["<unk>"], max_tokens=131072)
         vocab.set_default_index(vocab["<unk>"])
