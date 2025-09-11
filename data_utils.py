@@ -171,11 +171,10 @@ def inspect_client_data(client_data, client_idx=0, n_samples=10, dataset_name='m
         print(f"  Label {label}: {count} samples")
 
 def get_dataset(args):
-    transform = None
     if args.dataset == 'mnist':
-        data = datasets.MNIST(root=".", download=True)
-        n_classes = 10
         transform = transforms.Compose([transforms.ToTensor()])
+        data = datasets.MNIST(root=".", download=True, transform=transform)
+        n_classes = 10
     elif args.dataset == 'cifar10':
         n_classes = 10
         transform = transforms.Compose(
@@ -188,10 +187,8 @@ def get_dataset(args):
             ]
         )
         data = datasets.CIFAR10(root=".", download=True, transform=transform)
-        
+
     elif args.dataset == 'cifar100':
-        data = datasets.CIFAR100(root=".", download=True)
-        n_classes = 100
         transform = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -201,6 +198,8 @@ def get_dataset(args):
                 ),
             ]
         )
+        data = datasets.CIFAR100(root=".", download=True, transform=transform)
+        n_classes = 100
     else:
         raise NotImplementedError
 
