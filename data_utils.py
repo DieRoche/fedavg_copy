@@ -264,8 +264,8 @@ def get_dataset(args):
 
     plot_client_distributions(client_distribution, label_distribution, n_classes, save_path='client_distributions.png')
 
-    if len(client_data) > 0:
-        inspect_client_data(client_data, client_idx=0, n_samples=10, dataset_name=args.dataset, save_path='client_0_inspection.png')
+    if len(client_train_data) > 0:
+        inspect_client_data(client_train_data, client_idx=0, n_samples=10, dataset_name=args.dataset, save_path='client_0_inspection.png')
 
-    return client_data, test_data, n_classes, client_distribution, label_distribution
+    return client_train_data, client_val_data, test_data, n_classes, client_distribution, label_distribution
 

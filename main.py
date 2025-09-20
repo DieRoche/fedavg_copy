@@ -73,11 +73,19 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     client_data, val_data, n_classes, _, _ = get_dataset(args)
+
     global_model = ResNet18(num_classes=n_classes).to(device)
 
     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
-    n_clients = len(client_data)
+    n_clients = len(client_train_data)
+
+    val_loaders = []
+    for subset in client_val_data:
+        if len(subset) > 0:
+            val_loaders.append(DataLoader(subset, batch_size=args.batch_size, shuffle=False))
+        else:
+            val_loaders.append(None)
 
     wandb.init(project="fedavg", config=vars(args))
     total_upload_traffic = 0
@@ -98,10 +106,10 @@ def main():
 
         for idx in selected:
             local_model = copy.deepcopy(global_model)
-            loader = DataLoader(client_data[idx], batch_size=args.batch_size, shuffle=True)
+            loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=True)
             state_dict = client_update(local_model, loader, args.n_client_epoch, device, args.lr)
             local_states.append(state_dict)
-            local_sizes.append(len(client_data[idx]))
+            local_sizes.append(len(client_train_data[idx]))
 
             update = {k: state_dict[k] - global_model.state_dict()[k] for k in global_model.state_dict()}
             participating_updates.append(update)
@@ -109,7 +117,7 @@ def main():
             local_params = dict_to_tensor(state_dict)
             cos.append(F.cosine_similarity(local_params, global_params, dim=0).item())
 
-            train_loader = DataLoader(client_data[idx], batch_size=args.batch_size, shuffle=False)
+            train_loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=False)
             train_loss, _ = evaluate(local_model, train_loader, device)
             _, val_acc = evaluate(local_model, val_loader, device)
             training_loss.append(train_loss)
@@ -127,7 +135,7 @@ def main():
 
         training_loss_mean = np.mean(training_loss)
         training_loss_std = np.std(training_loss)
-
+        
         acc_clients = val_acc_clients
         acc_clients_mean = np.mean(acc_clients) if acc_clients else 0.0
         acc_clients_std = np.std(acc_clients) if acc_clients else 0.0
