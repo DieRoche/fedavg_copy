@@ -254,7 +254,12 @@ def get_dataset(args):
         client_distribution.append(client_dist)
         print("Client %d: %s" % (i, split_labels[i]))
 
-    client_data = [CustomSubset(data, idcs) for idcs in client_idcs]
+    client_data = []
+
+    for idcs in client_idcs:
+        shuffled_indices = np.random.permutation(idcs)
+        client_data.append(CustomSubset(data, shuffled_indices))
+
     test_data = CustomSubset(data, test_idcs)
 
     plot_client_distributions(client_distribution, label_distribution, n_classes, save_path='client_distributions.png')
