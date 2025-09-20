@@ -254,24 +254,11 @@ def get_dataset(args):
         client_distribution.append(client_dist)
         print("Client %d: %s" % (i, split_labels[i]))
 
-    client_train_data = []
-    client_val_data = []
-    val_split = 0.2
+    client_data = []
 
     for idcs in client_idcs:
         shuffled_indices = np.random.permutation(idcs)
-        split_point = int(len(shuffled_indices) * (1 - val_split))
-
-        if len(shuffled_indices) > 0 and split_point == 0:
-            split_point = 1
-        if split_point >= len(shuffled_indices):
-            split_point = max(len(shuffled_indices) - 1, 0)
-
-        train_indices = shuffled_indices[:split_point] if split_point > 0 else np.array([], dtype=int)
-        val_indices = shuffled_indices[split_point:]
-
-        client_train_data.append(CustomSubset(data, train_indices))
-        client_val_data.append(CustomSubset(data, val_indices))
+        client_data.append(CustomSubset(data, shuffled_indices))
 
     test_data = CustomSubset(data, test_idcs)
 

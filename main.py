@@ -72,10 +72,11 @@ def main():
     args = get_config()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    client_train_data, client_val_data, test_data, n_classes, _, _ = get_dataset(args)
+    client_data, val_data, n_classes, _, _ = get_dataset(args)
+
     global_model = ResNet18(num_classes=n_classes).to(device)
 
-    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
+    val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
     n_clients = len(client_train_data)
 
@@ -96,6 +97,7 @@ def main():
 
         cos = []
         training_loss = []
+        val_acc_clients = []
         participating_updates = []
         local_states = []
         local_sizes = []
@@ -117,13 +119,15 @@ def main():
 
             train_loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=False)
             train_loss, _ = evaluate(local_model, train_loader, device)
+            _, val_acc = evaluate(local_model, val_loader, device)
             training_loss.append(train_loss)
+            val_acc_clients.append(val_acc)
 
         weights = [size / sum(local_sizes) for size in local_sizes]
         global_state = fedavg(local_states, weights)
         global_model.load_state_dict(global_state)
 
-        loss, acc = evaluate(global_model, test_loader, device)
+        loss, acc = evaluate(global_model, val_loader, device)
         report = {"round": round_idx + 1, "loss": loss, "accuracy": acc}
 
         cos_mean = np.mean(cos)
@@ -131,18 +135,8 @@ def main():
 
         training_loss_mean = np.mean(training_loss)
         training_loss_std = np.std(training_loss)
-
-        acc_clients = []
-        for idx, subset in enumerate(client_val_data):
-            if len(subset) == 0:
-                acc_clients.append(0.0)
-                continue
-
-            if val_loaders[idx] is None:
-                val_loaders[idx] = DataLoader(subset, batch_size=args.batch_size, shuffle=False)
-            _, a = evaluate(global_model, val_loaders[idx], device)
-            acc_clients.append(a)
-
+        
+        acc_clients = val_acc_clients
         acc_clients_mean = np.mean(acc_clients) if acc_clients else 0.0
         acc_clients_std = np.std(acc_clients) if acc_clients else 0.0
 
