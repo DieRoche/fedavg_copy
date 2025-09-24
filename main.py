@@ -1,4 +1,5 @@
 import copy
+import gc
 import random
 from collections import OrderedDict
 
@@ -11,12 +12,6 @@ import wandb
 from config import get_config
 from data_utils import get_dataset
 from resnet18 import ResNet18
-
-wandb.init(
-    project="compression_FL",
-    
-    config={k: v for k, v in vars(args).items()}
-)
 
 def client_update(model, loader, epochs, device, lr):
     model.train()
@@ -64,6 +59,7 @@ def dict_to_tensor(state_dict):
 
 
 def cleanup_memory():
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -86,7 +82,7 @@ def main():
         else:
             val_loaders.append(None)
 
-    wandb.init(project="fedavg", config=vars(args))
+    wandb.init(project="compression_FL", config=vars(args))
     total_upload_traffic = 0
     total_download_traffic = 0
 
@@ -96,32 +92,42 @@ def main():
 
         cos = []
         training_loss = []
-        participating_updates = []
-        local_states = []
-        local_sizes = []
 
-        global_params = dict_to_tensor(global_model.state_dict())
+        global_state = global_model.state_dict()
+        global_params = dict_to_tensor({k: v.detach().cpu() for k, v in global_state.items()})
+        aggregated_state = OrderedDict(
+            (k, torch.zeros_like(v, device="cpu")) for k, v in global_state.items()
+        )
+
+        total_selected_size = sum(len(client_train_data[idx]) for idx in selected)
+        if total_selected_size == 0:
+            print("Skipping round due to empty selected clients.")
+            continue
+        round_upload_traffic = 0
 
         for idx in selected:
             local_model = copy.deepcopy(global_model)
             loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=True)
             state_dict = client_update(local_model, loader, args.n_client_epoch, device, args.lr)
-            local_states.append(state_dict)
-            local_sizes.append(len(client_train_data[idx]))
 
-            update = {k: state_dict[k] - global_model.state_dict()[k] for k in global_model.state_dict()}
-            participating_updates.append(update)
+            state_dict_cpu = {k: v.detach().cpu() for k, v in state_dict.items()}
+            weight = len(client_train_data[idx]) / total_selected_size
+            for k in aggregated_state:
+                aggregated_state[k] += state_dict_cpu[k] * weight
 
-            local_params = dict_to_tensor(state_dict)
+            local_params = dict_to_tensor(state_dict_cpu)
             cos.append(F.cosine_similarity(local_params, global_params, dim=0).item())
 
             train_loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=False)
             train_loss, _ = evaluate(local_model, train_loader, device)
             training_loss.append(train_loss)
 
-        weights = [size / sum(local_sizes) for size in local_sizes]
-        global_state = fedavg(local_states, weights)
-        global_model.load_state_dict(global_state)
+            round_upload_traffic += tensor_dict_bytes(state_dict_cpu)
+
+            del loader, train_loader, local_model, state_dict, state_dict_cpu, local_params
+            cleanup_memory()
+
+        global_model.load_state_dict(aggregated_state)
 
         loss, acc = evaluate(global_model, test_loader, device)
         report = {"round": round_idx + 1, "loss": loss, "accuracy": acc}
@@ -159,15 +165,17 @@ def main():
         report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
 
-        download_traffic = tensor_dict_bytes(global_state)
-        upload_traffic = sum(tensor_dict_bytes(update) for update in participating_updates)
-        total_upload_traffic += upload_traffic
+        broadcast_bytes = tensor_dict_bytes(aggregated_state)
+        download_traffic = broadcast_bytes * len(selected)
+        total_upload_traffic += round_upload_traffic
         total_download_traffic += download_traffic
-        report["upload_traffic"] = upload_traffic
+        report["upload_traffic"] = round_upload_traffic
         report["download_traffic"] = download_traffic
         report["overall_traffic"] = total_upload_traffic + total_download_traffic
 
         wandb.log(report)
+
+        del aggregated_state, global_state
 
         print(f"Round {round_idx + 1}, Clients Acc: {acc_clients}, Server Acc: {acc_servers}")
         cleanup_memory()
