@@ -159,7 +159,7 @@ def main():
         report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
 
-        download_traffic = tensor_dict_bytes(global_state)
+        download_traffic = tensor_dict_bytes(global_state) * args.n_client
         upload_traffic = sum(tensor_dict_bytes(update) for update in participating_updates)
         total_upload_traffic += upload_traffic
         total_download_traffic += download_traffic
