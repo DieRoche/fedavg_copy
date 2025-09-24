@@ -66,6 +66,13 @@ def cleanup_memory():
 
 def main():
     args = get_config()
+    
+    wandb.init(
+    project="compression_FL",
+    
+    config={k: v for k, v in vars(args).items()}
+    )
+    
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     client_train_data, client_val_data, test_data, n_classes, _, _ = get_dataset(args)
@@ -89,6 +96,7 @@ def main():
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
         selected = random.sample(range(n_clients), m)
+        report = {}
 
         cos = []
         training_loss = []
@@ -130,8 +138,7 @@ def main():
         global_model.load_state_dict(aggregated_state)
 
         loss, acc = evaluate(global_model, test_loader, device)
-        report = {"round": round_idx + 1, "loss": loss, "accuracy": acc}
-
+        
         cos_mean = np.mean(cos)
         cos_std = np.std(cos)
 
@@ -165,9 +172,9 @@ def main():
         report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
 
-        broadcast_bytes = tensor_dict_bytes(aggregated_state)
-        download_traffic = broadcast_bytes * len(selected)
-        total_upload_traffic += round_upload_traffic
+        download_traffic = tensor_dict_bytes(global_state) * args.n_client
+        upload_traffic = sum(tensor_dict_bytes(update) for update in participating_updates)
+        total_upload_traffic += upload_traffic
         total_download_traffic += download_traffic
         report["upload_traffic"] = round_upload_traffic
         report["download_traffic"] = download_traffic
