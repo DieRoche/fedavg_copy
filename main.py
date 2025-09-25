@@ -1,6 +1,6 @@
 import copy
+import gc
 import random
-from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -41,15 +41,6 @@ def evaluate(model, loader, device):
             correct += (pred == target).sum().item()
             total += target.size(0)
     return loss / total, correct / total
-
-
-def fedavg(state_dicts, weights):
-    avg = OrderedDict()
-    for k in state_dicts[0].keys():
-        avg[k] = sum(weight * sd[k] for sd, weight in zip(state_dicts, weights))
-    return avg
-
-
 def tensor_dict_bytes(tensor_dict):
     return sum(t.element_size() * t.nelement() for t in tensor_dict.values())
 
@@ -59,6 +50,7 @@ def dict_to_tensor(state_dict):
 
 
 def cleanup_memory():
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -99,21 +91,20 @@ def main():
 
         cos = []
         training_loss = []
-        participating_updates = []
-        local_states = []
-        local_sizes = []
+
+        selected_sizes = [len(client_train_data[idx]) for idx in selected]
+        total_size = sum(selected_sizes)
 
         global_params = dict_to_tensor(global_model.state_dict())
+        global_state_reference = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
 
-        for idx in selected:
+        weighted_state = None
+        upload_traffic_round = 0
+
+        for client_order, idx in enumerate(selected):
             local_model = copy.deepcopy(global_model)
             loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=True)
             state_dict = client_update(local_model, loader, args.n_client_epoch, device, args.lr)
-            local_states.append(state_dict)
-            local_sizes.append(len(client_train_data[idx]))
-
-            update = {k: state_dict[k] - global_model.state_dict()[k] for k in global_model.state_dict()}
-            participating_updates.append(update)
 
             local_params = dict_to_tensor(state_dict)
             cos.append(F.cosine_similarity(local_params, global_params, dim=0).item())
@@ -122,8 +113,30 @@ def main():
             train_loss, _ = evaluate(local_model, train_loader, device)
             training_loss.append(train_loss)
 
-        weights = [size / sum(local_sizes) for size in local_sizes]
-        global_state = fedavg(local_states, weights)
+            state_dict_cpu = {k: v.detach().cpu() for k, v in state_dict.items()}
+            weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
+
+            if weighted_state is None:
+                weighted_state = {k: tensor * weight for k, tensor in state_dict_cpu.items()}
+            else:
+                for key in weighted_state.keys():
+                    weighted_state[key] += state_dict_cpu[key] * weight
+
+            for key, tensor in state_dict_cpu.items():
+                diff = tensor - global_state_reference[key]
+                upload_traffic_round += diff.element_size() * diff.nelement()
+
+            del local_params
+            del state_dict
+            del loader
+            del train_loader
+            del state_dict_cpu
+            del local_model
+            cleanup_memory()
+
+        del global_state_reference
+
+        global_state = weighted_state if weighted_state is not None else global_model.state_dict()
         global_model.load_state_dict(global_state)
 
         loss, acc = evaluate(global_model, test_loader, device)
@@ -162,7 +175,7 @@ def main():
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
 
         download_traffic = tensor_dict_bytes(global_state) * args.n_client
-        upload_traffic = sum(tensor_dict_bytes(update) for update in participating_updates)
+        upload_traffic = upload_traffic_round
         total_upload_traffic += upload_traffic
         total_download_traffic += download_traffic
         report["upload_traffic"] = upload_traffic
