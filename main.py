@@ -80,13 +80,13 @@ def main():
         else:
             val_loaders.append(None)
 
-    wandb.init(project="fedavg", config=vars(args))
     total_upload_traffic = 0
     total_download_traffic = 0
 
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
         selected = random.sample(range(n_clients), m)
+        active_clients = len(selected)
         report = {}
 
         cos = []
@@ -174,7 +174,7 @@ def main():
         report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
 
-        download_traffic = tensor_dict_bytes(global_state) * args.n_client
+        download_traffic = tensor_dict_bytes(global_state) * active_clients
         upload_traffic = upload_traffic_round
         total_upload_traffic += upload_traffic
         total_download_traffic += download_traffic
