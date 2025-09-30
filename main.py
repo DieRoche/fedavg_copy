@@ -174,12 +174,14 @@ def main():
         report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
 
-        download_traffic = tensor_dict_bytes(global_state) * active_clients
+        model_size_bytes = tensor_dict_bytes(global_state)
+        download_traffic = model_size_bytes * active_clients
         upload_traffic = upload_traffic_round
         total_upload_traffic += upload_traffic
         total_download_traffic += download_traffic
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
+        report["upload_traffic_per_client"] = model_size_bytes
         report["overall_traffic"] = total_upload_traffic + total_download_traffic
 
         wandb.log(report)
