@@ -11,6 +11,7 @@ import wandb
 from config import get_config
 from data_utils import get_dataset
 from resnet18 import ResNet18
+from effnet import EfficientNetB0_CIFAR
 
 
 def client_update(model, loader, epochs, device, lr):
@@ -67,7 +68,16 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     client_train_data, client_val_data, test_data, n_classes, _, _ = get_dataset(args)
-    global_model = ResNet18(num_classes=n_classes).to(device)
+
+    model_name = args.model.lower()
+    if model_name in {"resnet", "resnet18"}:
+        global_model = ResNet18(num_classes=n_classes).to(device)
+    elif model_name in {"effnet", "efficientnet", "efficientnetb0"}:
+        if args.dataset not in {"cifar10", "cifar100"}:
+            raise ValueError("EfficientNetB0_CIFAR is only compatible with CIFAR datasets.")
+        global_model = EfficientNetB0_CIFAR(num_classes=n_classes).to(device)
+    else:
+        raise ValueError(f"Unsupported model selection: {args.model}")
 
     test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
 
