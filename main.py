@@ -56,6 +56,20 @@ def dict_to_tensor(state_dict):
     return torch.cat([v.flatten() for v in state_dict.values()])
 
 
+def tensor_dict_sparsity(tensor_dict):
+    total_elements = 0
+    zero_elements = 0
+
+    for tensor in tensor_dict.values():
+        total_elements += tensor.numel()
+        zero_elements += tensor.numel() - torch.count_nonzero(tensor).item()
+
+    if total_elements == 0:
+        return 0.0
+
+    return zero_elements / total_elements
+
+
 def estimate_forward_flops(model, sample_input, device):
     flops = 0.0
     handles = []
@@ -203,6 +217,8 @@ def main():
     initial_report["round_flops"] = initial_round_flops
     total_flops += initial_round_flops
     initial_report["total_flops"] = total_flops
+    initial_report["upload_sparsity_mean"] = float("nan")
+    initial_report["download_sparsity"] = tensor_dict_sparsity(global_model.state_dict())
 
     wandb.log(initial_report)
 
@@ -224,6 +240,7 @@ def main():
         weighted_state = None
         upload_traffic_round = 0
         round_flops = 0.0
+        client_sparsities = []
 
         for client_order, idx in enumerate(selected):
             local_model = copy.deepcopy(global_model)
@@ -246,6 +263,9 @@ def main():
             state_dict_cpu = {k: v.detach().cpu() for k, v in state_dict.items()}
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
 
+            client_zero_elements = 0
+            client_total_elements = 0
+
             if weighted_state is None:
                 weighted_state = {k: tensor * weight for k, tensor in state_dict_cpu.items()}
             else:
@@ -255,6 +275,15 @@ def main():
             for key, tensor in state_dict_cpu.items():
                 diff = tensor - global_state_reference[key]
                 upload_traffic_round += diff.element_size() * diff.nelement()
+
+                non_zero_elements = torch.count_nonzero(diff).item()
+                client_total_elements += diff.numel()
+                client_zero_elements += diff.numel() - non_zero_elements
+
+            if client_total_elements > 0:
+                client_sparsities.append(client_zero_elements / client_total_elements)
+            else:
+                client_sparsities.append(0.0)
 
             del local_params
             del state_dict
@@ -314,6 +343,8 @@ def main():
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
         report["upload_traffic_per_client"] = model_size_bytes
+        report["upload_sparsity_mean"] = float(np.mean(client_sparsities)) if client_sparsities else 0.0
+        report["download_sparsity"] = tensor_dict_sparsity(global_state)
         report["overall_traffic"] = total_upload_traffic + total_download_traffic
         report["round_flops"] = round_flops
         total_flops += round_flops
