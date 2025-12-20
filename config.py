@@ -2,6 +2,16 @@ import argparse
 import random
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ("yes", "true", "t", "1", "y"):
+        return True
+    if value.lower() in ("no", "false", "f", "0", "n"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
 def get_config():
     parser = argparse.ArgumentParser(
         description="Federated Averaging Experiments")
@@ -23,6 +33,11 @@ def get_config():
     parser.add_argument("--ours_n_sample", type=int, default=1)
     parser.add_argument("--lambd", type=float, default=0.0)
     parser.add_argument("--topk", type=float, default=0.01)
+
+    parser.add_argument("--enable_sparse_masking", action="store_true", default=False)
+    parser.add_argument("--sparsity_rate", type=float, default=0.0)
+    parser.add_argument("--sparsity_min_density", type=float, default=0.0)
+    parser.add_argument("--wandb_enabled", type=str2bool, default=True)
 
     parser.add_argument("--device", type=str, default="cuda")
 
