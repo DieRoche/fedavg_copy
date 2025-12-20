@@ -1,5 +1,6 @@
 import copy
 import gc
+import math
 import random
 
 import numpy as np
@@ -55,14 +56,72 @@ def cleanup_memory():
         torch.cuda.empty_cache()
 
 
+def apply_sparse_mask(delta_dict, param_keys, args):
+    """Apply Gauss-Southwell style masking to dense deltas.
+
+    The function keeps the payload dense (identical tensor shapes) but zeros out
+    coordinates not selected by the magnitude-based mask.
+    """
+
+    abs_delta_flat = torch.cat([delta_dict[k].abs().reshape(-1) for k in param_keys])
+    total_params = abs_delta_flat.numel()
+
+    if not args.enable_sparse_masking or args.sparsity_rate == 0.0:
+        mask_flat = torch.ones_like(abs_delta_flat, dtype=torch.bool)
+    else:
+        if args.sparsity_rate >= 1.0:
+            threshold = abs_delta_flat.max()
+        else:
+            threshold = torch.quantile(abs_delta_flat, args.sparsity_rate)
+        mask_flat = abs_delta_flat >= threshold
+
+        density = mask_flat.float().mean().item()
+        if density < args.sparsity_min_density:
+            k = max(1, math.ceil(args.sparsity_min_density * total_params))
+            # Recompute mask using top-k to enforce minimum density.
+            topk_values, _ = torch.topk(abs_delta_flat, k)
+            threshold = topk_values[-1]
+            mask_flat = abs_delta_flat >= threshold
+
+    density = mask_flat.float().mean().item()
+    sparsity = 1.0 - density
+    assert 0.0 <= sparsity <= 1.0, "Sparsity out of bounds"
+
+    delta_flat = torch.cat([delta_dict[k].reshape(-1) for k in param_keys])
+    l2_norm_delta = torch.norm(delta_flat).item()
+
+    delta_sparse = {}
+    start = 0
+    for key in param_keys:
+        numel = delta_dict[key].numel()
+        mask_tensor = mask_flat[start : start + numel].reshape(delta_dict[key].shape)
+        delta_sparse[key] = delta_dict[key] * mask_tensor
+        start += numel
+
+    delta_sparse_flat = torch.cat([delta_sparse[k].reshape(-1) for k in param_keys])
+    l2_norm_delta_sparse = torch.norm(delta_sparse_flat).item()
+
+    metrics = {
+        "total_params": total_params,
+        "nonzero_params": int(mask_flat.sum().item()),
+        "density": density,
+        "sparsity": sparsity,
+        "l2_norm_delta": l2_norm_delta,
+        "l2_norm_delta_sparse": l2_norm_delta_sparse,
+    }
+
+    assert metrics["nonzero_params"] <= metrics["total_params"], "Mask overflow"
+    return delta_sparse, metrics
+
+
 def main():
     args = get_config()
-    
-    wandb.init(
-    project="compression_FL",
-    
-    config={k: v for k, v in vars(args).items()}
-    )
+
+    if args.wandb_enabled:
+        wandb.init(
+            project="Gauss-Southwell",
+            config={k: v for k, v in vars(args).items()},
+        )
     
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -80,7 +139,6 @@ def main():
         else:
             val_loaders.append(None)
 
-    wandb.init(project="fedavg", config=vars(args))
     total_upload_traffic = 0
     total_download_traffic = 0
 
@@ -97,9 +155,12 @@ def main():
 
         global_params = dict_to_tensor(global_model.state_dict())
         global_state_reference = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
+        global_state_device = {k: v.to(device) for k, v in global_state_reference.items()}
+        param_keys = list(global_state_reference.keys())
 
-        weighted_state = None
+        aggregated_delta = None
         upload_traffic_round = 0
+        client_sparsity_metrics = []
 
         for client_order, idx in enumerate(selected):
             local_model = copy.deepcopy(global_model)
@@ -113,18 +174,34 @@ def main():
             train_loss, _ = evaluate(local_model, train_loader, device)
             training_loss.append(train_loss)
 
-            state_dict_cpu = {k: v.detach().cpu() for k, v in state_dict.items()}
+            delta_dict = {k: state_dict[k] - global_state_device[k] for k in param_keys}
+            delta_sparse, metrics = apply_sparse_mask(delta_dict, param_keys, args)
+            state_dict_cpu = {k: v.detach().cpu() for k, v in delta_sparse.items()}
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
 
-            if weighted_state is None:
-                weighted_state = {k: tensor * weight for k, tensor in state_dict_cpu.items()}
+            if aggregated_delta is None:
+                aggregated_delta = {k: tensor * weight for k, tensor in state_dict_cpu.items()}
             else:
-                for key in weighted_state.keys():
-                    weighted_state[key] += state_dict_cpu[key] * weight
+                for key in aggregated_delta.keys():
+                    aggregated_delta[key] += state_dict_cpu[key] * weight
 
-            for key, tensor in state_dict_cpu.items():
-                diff = tensor - global_state_reference[key]
-                upload_traffic_round += diff.element_size() * diff.nelement()
+            upload_traffic_round += tensor_dict_bytes(state_dict_cpu)
+
+            metrics.update({"client_id": idx, "round": round_idx + 1})
+            metrics["density"] = metrics.get("density", 0.0)
+            metrics["sparsity"] = metrics.get("sparsity", 0.0)
+            assert abs(metrics["density"] + metrics["sparsity"] - 1.0) < 1e-6
+            client_sparsity_metrics.append(metrics)
+
+            if args.wandb_enabled:
+                wandb.log(
+                    {
+                        "client_id": idx,
+                        "round": round_idx + 1,
+                        "sparsity": metrics["sparsity"],
+                        "density": metrics["density"],
+                    }
+                )
 
             del local_params
             del state_dict
@@ -135,8 +212,14 @@ def main():
             cleanup_memory()
 
         del global_state_reference
+        del global_state_device
 
-        global_state = weighted_state if weighted_state is not None else global_model.state_dict()
+        aggregated_delta = aggregated_delta if aggregated_delta is not None else {}
+        global_state = global_model.state_dict()
+        for key in param_keys:
+            delta_tensor = aggregated_delta.get(key, torch.zeros_like(global_state[key]))
+            global_state[key] = global_state[key] + delta_tensor.to(global_state[key].device)
+
         global_model.load_state_dict(global_state)
 
         loss, acc = evaluate(global_model, test_loader, device)
@@ -165,6 +248,18 @@ def main():
         acc_servers_mean = np.mean(acc_servers)
         acc_servers_std = np.std(acc_servers)
 
+        if client_sparsity_metrics:
+            sparsities = [m["sparsity"] for m in client_sparsity_metrics]
+            densities = [m["density"] for m in client_sparsity_metrics]
+            report["sparsity/mean"] = float(np.mean(sparsities))
+            report["sparsity/min"] = float(np.min(sparsities))
+            report["sparsity/max"] = float(np.max(sparsities))
+            report["density/mean"] = float(np.mean(densities))
+            delta_norms = [m.get("l2_norm_delta", 0.0) for m in client_sparsity_metrics]
+            delta_sparse_norms = [m.get("l2_norm_delta_sparse", 0.0) for m in client_sparsity_metrics]
+            report["delta_norm/mean"] = float(np.mean(delta_norms))
+            report["delta_sparse_norm/mean"] = float(np.mean(delta_sparse_norms))
+
         report["cos_lowest"] = cos_mean - cos_std
         report["cos_highest"] = cos_mean + cos_std
         report["training_loss_lowest"] = training_loss_mean - training_loss_std
@@ -173,6 +268,7 @@ def main():
         report["acc_clients_highest"] = acc_clients_mean + acc_clients_std
         report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
+        report["round"] = round_idx + 1
 
         model_size_bytes = tensor_dict_bytes(global_state)
         download_traffic = model_size_bytes * args.n_client
@@ -184,7 +280,8 @@ def main():
         report["upload_traffic_per_client"] = model_size_bytes
         report["overall_traffic"] = total_upload_traffic + total_download_traffic
 
-        wandb.log(report)
+        if args.wandb_enabled:
+            wandb.log(report)
 
         print(f"Round {round_idx + 1}, Clients Acc: {acc_clients}, Server Acc: {acc_servers}")
         cleanup_memory()
