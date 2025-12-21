@@ -175,6 +175,9 @@ def main():
             training_loss.append(train_loss)
 
             delta_dict = {k: state_dict[k] - global_state_device[k] for k in param_keys}
+            # Apply Gauss-Southwell masking only for the payload that is transmitted back
+            # to the server. The dense delta is kept for local metrics and aggregation
+            # bookkeeping.
             delta_sparse, metrics = apply_sparse_mask(delta_dict, param_keys, args)
             state_dict_cpu = {k: v.detach().cpu() for k, v in delta_sparse.items()}
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
@@ -200,7 +203,9 @@ def main():
                         "round": round_idx + 1,
                         "sparsity": metrics["sparsity"],
                         "density": metrics["density"],
-                    }
+                    },
+                    step=round_idx + 1,
+                    commit=False,
                 )
 
             del local_params
@@ -281,7 +286,7 @@ def main():
         report["overall_traffic"] = total_upload_traffic + total_download_traffic
 
         if args.wandb_enabled:
-            wandb.log(report)
+            wandb.log(report, step=round_idx + 1, commit=True)
 
         print(f"Round {round_idx + 1}, Clients Acc: {acc_clients}, Server Acc: {acc_servers}")
         cleanup_memory()
