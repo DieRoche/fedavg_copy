@@ -37,6 +37,12 @@ def get_config():
     parser.add_argument("--enable_sparse_masking", action="store_true", default=False)
     parser.add_argument("--sparsity_rate", type=float, default=0.0)
     parser.add_argument("--sparsity_min_density", type=float, default=0.0)
+    parser.add_argument(
+        "--sparsity_compression",
+        type=str,
+        default="CSR",
+        choices=["CSR", "CSC", "BSR"],
+    )
     parser.add_argument("--wandb_enabled", type=str2bool, default=True)
 
     parser.add_argument("--device", type=str, default="cuda")
