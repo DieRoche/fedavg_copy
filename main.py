@@ -11,6 +11,7 @@ import wandb
 
 from config import get_config
 from data_utils import get_dataset
+from compression import compress_bsr, compress_csc, compress_csr
 from resnet18 import ResNet18
 
 
@@ -44,6 +45,33 @@ def evaluate(model, loader, device):
     return loss / total, correct / total
 def tensor_dict_bytes(tensor_dict):
     return sum(t.element_size() * t.nelement() for t in tensor_dict.values())
+
+
+def compressed_tensor_bytes(tensor, compression_type):
+    dense_tensor = tensor.detach().cpu()
+    if dense_tensor.ndim == 1:
+        dense = dense_tensor.numpy().reshape(-1, 1)
+    elif dense_tensor.ndim == 2:
+        dense = dense_tensor.numpy()
+    else:
+        dense = dense_tensor.numpy().reshape(dense_tensor.shape[0], -1)
+    if compression_type == "CSR":
+        csr = compress_csr(dense)
+        return csr.values.nbytes + csr.col_indices.nbytes + csr.row_ptr.nbytes
+    if compression_type == "CSC":
+        csc = compress_csc(dense)
+        return csc.values.nbytes + csc.row_indices.nbytes + csc.col_ptr.nbytes
+    if compression_type == "BSR":
+        bsr = compress_bsr(dense, block_size=(1, 1))
+        return bsr.data.nbytes + bsr.col_indices.nbytes + bsr.row_ptr.nbytes
+    raise ValueError(f"Unknown compression type: {compression_type}")
+
+
+def tensor_dict_compressed_bytes(tensor_dict, compression_type):
+    return sum(
+        compressed_tensor_bytes(tensor, compression_type)
+        for tensor in tensor_dict.values()
+    )
 
 
 def dict_to_tensor(state_dict):
@@ -160,6 +188,7 @@ def main():
 
         aggregated_delta = None
         upload_traffic_round = 0
+        per_client_upload_bytes = []
         client_sparsity_metrics = []
 
         for client_order, idx in enumerate(selected):
@@ -188,7 +217,15 @@ def main():
                 for key in aggregated_delta.keys():
                     aggregated_delta[key] += state_dict_cpu[key] * weight
 
-            upload_traffic_round += tensor_dict_bytes(state_dict_cpu)
+            if args.enable_sparse_masking:
+                client_upload_bytes = tensor_dict_compressed_bytes(
+                    state_dict_cpu,
+                    args.sparsity_compression,
+                )
+            else:
+                client_upload_bytes = tensor_dict_bytes(state_dict_cpu)
+            upload_traffic_round += client_upload_bytes
+            per_client_upload_bytes.append(client_upload_bytes)
 
             metrics.update({"client_id": idx, "round": round_idx + 1})
             metrics["density"] = metrics.get("density", 0.0)
@@ -282,7 +319,9 @@ def main():
         total_download_traffic += download_traffic
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
-        report["upload_traffic_per_client"] = model_size_bytes
+        report["upload_traffic_per_client"] = float(
+            np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
+        )
         report["overall_traffic"] = total_upload_traffic + total_download_traffic
 
         if args.wandb_enabled:
