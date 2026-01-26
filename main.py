@@ -128,11 +128,16 @@ def cleanup_memory():
 
 def main():
     args = get_config()
-    
+
+    raw_clients = args.n_client * args.client_fraction
+    clients_label = int(raw_clients) if float(raw_clients).is_integer() else raw_clients
+    run_name = f"Fedavg_{args.dataset}_{args.model}_{clients_label}cl"
+
     wandb.init(
-    project="compression_FL",
-    
-    config={k: v for k, v in vars(args).items()}
+        project="compression_FL",
+        group="German new run",
+        name=run_name,
+        config={k: v for k, v in vars(args).items()},
     )
     
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
