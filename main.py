@@ -11,52 +11,8 @@ import wandb
 
 from config import get_config
 from data_utils import get_dataset
-from compression import compress_csr
+from compression import compress_csr, pack_csr
 from resnet18 import ResNet18
-
-
-def _encode_varint_u32(value):
-    assert 0 <= value <= 0xFFFFFFFF, "Value out of uint32 range"
-    out = bytearray()
-    v = int(value)
-    while True:
-        to_write = v & 0x7F
-        v >>= 7
-        if v:
-            out.append(to_write | 0x80)
-        else:
-            out.append(to_write)
-            break
-    return out
-
-
-def _varint_encode_array(values):
-    out = bytearray()
-    for value in values:
-        out.extend(_encode_varint_u32(int(value)))
-    return bytes(out)
-
-
-def _varint_encode_row_ptr(row_ptr):
-    assert row_ptr[0] == 0, "row_ptr must start at 0"
-    diffs = np.diff(row_ptr, prepend=row_ptr[0])
-    assert np.all(diffs >= 0), "row_ptr deltas must be non-negative"
-    return _varint_encode_array(diffs)
-
-
-def _varint_encode_col_indices_by_row(col_indices, row_ptr):
-    encoded = bytearray()
-    for row_idx in range(len(row_ptr) - 1):
-        start = int(row_ptr[row_idx])
-        end = int(row_ptr[row_idx + 1])
-        row_cols = col_indices[start:end]
-        if row_cols.size == 0:
-            continue
-        assert np.all(row_cols[1:] >= row_cols[:-1]), "col_indices must be nondecreasing"
-        deltas = np.diff(row_cols, prepend=row_cols[0])
-        assert np.all(deltas >= 0), "col_indices deltas must be non-negative"
-        encoded.extend(_varint_encode_array(deltas))
-    return bytes(encoded)
 
 
 def client_update(model, loader, epochs, device, lr):
@@ -104,17 +60,8 @@ def compressed_tensor_bytes(tensor, compression_type):
         return tensor.element_size() * tensor.nelement()
     if compression_type == "CSR":
         csr = compress_csr(dense)
-        row_ptr = csr.row_ptr.astype(np.int32, copy=False)
-        col_indices = csr.col_indices.astype(np.int32, copy=False)
-        try:
-            assert row_ptr[0] == 0, "row_ptr must start at 0"
-            assert np.all(row_ptr[1:] >= row_ptr[:-1]), "row_ptr must be nondecreasing"
-            row_ptr_bytes = _varint_encode_row_ptr(row_ptr)
-            col_indices_bytes = _varint_encode_col_indices_by_row(col_indices, row_ptr)
-        except AssertionError:
-            row_ptr_bytes = _varint_encode_array(row_ptr)
-            col_indices_bytes = _varint_encode_array(col_indices)
-        return csr.values.nbytes + len(col_indices_bytes) + len(row_ptr_bytes)
+        packet = pack_csr(csr)
+        return len(packet)
     raise ValueError(f"Unknown compression type: {compression_type}")
 
 
