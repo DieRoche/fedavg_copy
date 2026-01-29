@@ -41,7 +41,7 @@ def get_config():
         "--sparsity_compression",
         type=str,
         default="CSR",
-        choices=["CSR", "CSC", "BSR"],
+        choices=["CSR"],
     )
     parser.add_argument("--wandb_enabled", type=str2bool, default=True)
 

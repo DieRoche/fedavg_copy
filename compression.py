@@ -55,8 +55,8 @@ def compress_csr(matrix: np.ndarray | torch.Tensor) -> CSRMatrix:
 
     return CSRMatrix(
         values=np.array(values, dtype=dense.dtype),
-        col_indices=np.array(col_indices, dtype=np.int64),
-        row_ptr=np.array(row_ptr, dtype=np.int64),
+        col_indices=np.array(col_indices, dtype=np.int32),
+        row_ptr=np.array(row_ptr, dtype=np.int32),
         shape=dense.shape,
     )
 
