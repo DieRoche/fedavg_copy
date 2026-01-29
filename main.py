@@ -11,7 +11,7 @@ import wandb
 
 from config import get_config
 from data_utils import get_dataset
-from compression import compress_bsr, compress_csc, compress_csr
+from compression import compress_csr, pack_csr
 from resnet18 import ResNet18
 
 
@@ -48,16 +48,20 @@ def tensor_dict_bytes(tensor_dict):
 
 
 def compressed_tensor_bytes(tensor, compression_type):
-    dense = tensor.detach().cpu().numpy().reshape(-1, 1)
+    if tensor.ndim == 1:
+        return tensor.element_size() * tensor.nelement()
+
+    dense_tensor = tensor.detach().cpu()
+    if tensor.ndim == 2:
+        dense = dense_tensor.numpy()
+    elif tensor.ndim == 4:
+        dense = dense_tensor.reshape(dense_tensor.size(0), -1).numpy()
+    else:
+        return tensor.element_size() * tensor.nelement()
     if compression_type == "CSR":
         csr = compress_csr(dense)
-        return csr.values.nbytes + csr.col_indices.nbytes + csr.row_ptr.nbytes
-    if compression_type == "CSC":
-        csc = compress_csc(dense)
-        return csc.values.nbytes + csc.row_indices.nbytes + csc.col_ptr.nbytes
-    if compression_type == "BSR":
-        bsr = compress_bsr(dense, block_size=(1, 1))
-        return bsr.data.nbytes + bsr.col_indices.nbytes + bsr.row_ptr.nbytes
+        packet = pack_csr(csr)
+        return len(packet)
     raise ValueError(f"Unknown compression type: {compression_type}")
 
 
