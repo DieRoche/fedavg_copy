@@ -43,6 +43,13 @@ def get_config():
         default="CSR",
         choices=["CSR"],
     )
+    parser.add_argument(
+        "--quantization_bits",
+        type=int,
+        default=16,
+        choices=[16, 8, 4],
+        help="Post-sparsity quantization bits for client-to-server payload.",
+    )
     parser.add_argument("--wandb_enabled", type=str2bool, default=True)
 
     parser.add_argument("--device", type=str, default="cuda")

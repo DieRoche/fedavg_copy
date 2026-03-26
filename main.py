@@ -65,9 +65,80 @@ def compressed_tensor_bytes(tensor, compression_type):
     raise ValueError(f"Unknown compression type: {compression_type}")
 
 
-def tensor_dict_compressed_bytes(tensor_dict, compression_type):
+def quantize_tensor(tensor, bits):
+    if bits == 16:
+        return tensor.to(torch.float16).to(dtype=tensor.dtype)
+
+    if bits not in (8, 4):
+        raise ValueError(f"Unsupported quantization bits: {bits}")
+
+    if tensor.numel() == 0:
+        return tensor.clone()
+
+    absmax = tensor.abs().max()
+    if absmax.item() == 0.0:
+        return torch.zeros_like(tensor)
+
+    qmax = (1 << (bits - 1)) - 1
+    scale = absmax / qmax
+    q = torch.round(tensor / scale).clamp(-qmax, qmax).to(torch.int8)
+    return (q.to(torch.float32) * scale).to(dtype=tensor.dtype)
+
+
+def quantize_state_dict(state_dict, bits):
+    return {k: quantize_tensor(v, bits) for k, v in state_dict.items()}
+
+
+def quantized_tensor_bytes(tensor, bits):
+    numel = tensor.numel()
+    if bits == 16:
+        return numel * 2
+    if bits == 8:
+        return numel + 4
+    if bits == 4:
+        return (numel + 1) // 2 + 4
+    raise ValueError(f"Unsupported quantization bits: {bits}")
+
+
+def compressed_quantized_tensor_bytes(tensor, compression_type, bits):
+    if tensor.ndim == 1:
+        return quantized_tensor_bytes(tensor, bits)
+
+    dense_tensor = tensor.detach().cpu()
+    if tensor.ndim == 2:
+        dense = dense_tensor.numpy()
+    elif tensor.ndim == 4:
+        dense = dense_tensor.reshape(dense_tensor.size(0), -1).numpy()
+    else:
+        return quantized_tensor_bytes(tensor, bits)
+
+    if compression_type == "CSR":
+        csr = compress_csr(dense)
+        packet = pack_csr(csr)
+        nnz = csr.values.size
+        if bits == 16:
+            return len(packet) - (nnz * 2)
+        if bits == 8:
+            return len(packet) - (nnz * 3) + 4
+        if bits == 4:
+            return len(packet) - (nnz * 4) + ((nnz + 1) // 2) + 4
+        raise ValueError(f"Unsupported quantization bits: {bits}")
+
+    raise ValueError(f"Unknown compression type: {compression_type}")
+
+
+def tensor_dict_payload_bytes(tensor_dict, args):
+    if args.enable_sparse_masking:
+        return sum(
+            compressed_quantized_tensor_bytes(
+                tensor,
+                args.sparsity_compression,
+                args.quantization_bits,
+            )
+            for tensor in tensor_dict.values()
+        )
     return sum(
-        compressed_tensor_bytes(tensor, compression_type)
+        quantized_tensor_bytes(tensor, args.quantization_bits)
         for tensor in tensor_dict.values()
     )
 
@@ -207,6 +278,7 @@ def main():
             # bookkeeping.
             delta_sparse, metrics = apply_sparse_mask(delta_dict, param_keys, args)
             state_dict_cpu = {k: v.detach().cpu() for k, v in delta_sparse.items()}
+            state_dict_cpu = quantize_state_dict(state_dict_cpu, args.quantization_bits)
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
 
             if aggregated_delta is None:
@@ -215,13 +287,7 @@ def main():
                 for key in aggregated_delta.keys():
                     aggregated_delta[key] += state_dict_cpu[key] * weight
 
-            if args.enable_sparse_masking:
-                client_upload_bytes = tensor_dict_compressed_bytes(
-                    state_dict_cpu,
-                    args.sparsity_compression,
-                )
-            else:
-                client_upload_bytes = tensor_dict_bytes(state_dict_cpu)
+            client_upload_bytes = tensor_dict_payload_bytes(state_dict_cpu, args)
             upload_traffic_round += client_upload_bytes
             per_client_upload_bytes.append(client_upload_bytes)
 
