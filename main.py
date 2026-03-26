@@ -214,9 +214,18 @@ def apply_sparse_mask(delta_dict, param_keys, args):
 def main():
     args = get_config()
 
+    selected_clients = int(args.n_client * args.client_fraction)
+    quantization_bits = getattr(args, "quantization_bits", None)
+    if args.enable_sparse_masking and args.sparsity_rate > 0.0:
+        compression_prefix = f"GS{quantization_bits}" if quantization_bits is not None else "GS"
+    else:
+        compression_prefix = "fedavg"
+    run_name = f"{compression_prefix}_{args.dataset}_{args.model}_{selected_clients}cl"
+
     if args.wandb_enabled:
         wandb.init(
             project="Gauss-Southwell",
+            name=run_name,
             config={k: v for k, v in vars(args).items()},
         )
     
