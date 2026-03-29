@@ -11,7 +11,7 @@ import wandb
 
 from config import get_config
 from data_utils import get_dataset
-from compression import compress_csr, pack_csr
+from compression import compress_csr, decompress_csr, pack_csr, unpack_csr
 from resnet18 import ResNet18
 
 
@@ -85,8 +85,100 @@ def quantize_tensor(tensor, bits):
     return (q.to(torch.float32) * scale).to(dtype=tensor.dtype)
 
 
+def quantize_tensor_for_transport(tensor, bits):
+    if bits == 16:
+        return tensor.to(torch.float16), None
+    if bits not in (8, 4):
+        raise ValueError(f"Unsupported quantization bits: {bits}")
+    if tensor.numel() == 0:
+        return torch.empty_like(tensor, dtype=torch.int8), 1.0
+
+    absmax = tensor.abs().max()
+    if absmax.item() == 0.0:
+        return torch.zeros_like(tensor, dtype=torch.int8), 1.0
+
+    qmax = (1 << (bits - 1)) - 1
+    scale = (absmax / qmax).item()
+    q = torch.round(tensor / scale).clamp(-qmax, qmax).to(torch.int8)
+    return q, scale
+
+
+def dequantize_tensor_from_transport(q_tensor, scale, bits, target_dtype):
+    if bits == 16:
+        return q_tensor.to(dtype=target_dtype)
+    if bits not in (8, 4):
+        raise ValueError(f"Unsupported quantization bits: {bits}")
+    return (q_tensor.to(torch.float32) * float(scale)).to(dtype=target_dtype)
+
+
 def quantize_state_dict(state_dict, bits):
     return {k: quantize_tensor(v, bits) for k, v in state_dict.items()}
+
+
+def serialize_tensor_payload(tensor, bits, enable_sparse_masking):
+    cpu_tensor = tensor.detach().cpu()
+    transport_dtype = str(cpu_tensor.dtype)
+
+    use_csr = enable_sparse_masking and cpu_tensor.ndim in (2, 4)
+    if use_csr:
+        csr_shape = tuple(cpu_tensor.shape)
+        dense_2d = cpu_tensor if cpu_tensor.ndim == 2 else cpu_tensor.reshape(cpu_tensor.size(0), -1)
+        csr = compress_csr(dense_2d.numpy())
+        values = torch.from_numpy(csr.values)
+        q_values, scale = quantize_tensor_for_transport(values, bits)
+        q_csr = type(csr)(
+            values=q_values.cpu().numpy(),
+            col_indices=csr.col_indices,
+            row_ptr=csr.row_ptr,
+            shape=csr.shape,
+        )
+        packet = pack_csr(q_csr)
+        return {
+            "mode": "csr",
+            "packet": packet,
+            "scale": scale,
+            "bits": bits,
+            "transport_dtype": transport_dtype,
+            "orig_shape": csr_shape,
+        }, len(packet) + (4 if scale is not None else 0)
+
+    q_tensor, scale = quantize_tensor_for_transport(cpu_tensor, bits)
+    payload = {
+        "mode": "dense",
+        "q_tensor": q_tensor,
+        "scale": scale,
+        "bits": bits,
+        "transport_dtype": transport_dtype,
+        "orig_shape": tuple(cpu_tensor.shape),
+    }
+    payload_bytes = quantized_tensor_bytes(cpu_tensor, bits)
+    return payload, payload_bytes
+
+
+def deserialize_tensor_payload(payload):
+    bits = payload["bits"]
+    target_dtype = getattr(torch, payload["transport_dtype"].split(".")[-1])
+
+    if payload["mode"] == "csr":
+        csr_q = unpack_csr(payload["packet"])
+        q_values = torch.from_numpy(csr_q.values.copy())
+        values = dequantize_tensor_from_transport(q_values, payload["scale"], bits, target_dtype).numpy()
+        csr_deq = type(csr_q)(
+            values=values,
+            col_indices=csr_q.col_indices,
+            row_ptr=csr_q.row_ptr,
+            shape=csr_q.shape,
+        )
+        dense = decompress_csr(csr_deq)
+        tensor = torch.from_numpy(dense).reshape(payload["orig_shape"])
+        return tensor.to(dtype=target_dtype)
+
+    if payload["mode"] == "dense":
+        q_tensor = payload["q_tensor"]
+        tensor = dequantize_tensor_from_transport(q_tensor, payload["scale"], bits, target_dtype)
+        return tensor.reshape(payload["orig_shape"]).to(dtype=target_dtype)
+
+    raise ValueError(f"Unknown payload mode: {payload['mode']}")
 
 
 def quantized_tensor_bytes(tensor, bits):
@@ -287,16 +379,26 @@ def main():
             # bookkeeping.
             delta_sparse, metrics = apply_sparse_mask(delta_dict, param_keys, args)
             state_dict_cpu = {k: v.detach().cpu() for k, v in delta_sparse.items()}
-            state_dict_cpu = quantize_state_dict(state_dict_cpu, args.quantization_bits)
+            payload_dict = {}
+            reconstructed_state_dict = {}
+            client_upload_bytes = 0
+            for key, tensor in state_dict_cpu.items():
+                payload, payload_size = serialize_tensor_payload(
+                    tensor,
+                    args.quantization_bits,
+                    args.enable_sparse_masking,
+                )
+                payload_dict[key] = payload
+                reconstructed_state_dict[key] = deserialize_tensor_payload(payload)
+                client_upload_bytes += payload_size
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
 
             if aggregated_delta is None:
-                aggregated_delta = {k: tensor * weight for k, tensor in state_dict_cpu.items()}
+                aggregated_delta = {k: tensor * weight for k, tensor in reconstructed_state_dict.items()}
             else:
                 for key in aggregated_delta.keys():
-                    aggregated_delta[key] += state_dict_cpu[key] * weight
+                    aggregated_delta[key] += reconstructed_state_dict[key] * weight
 
-            client_upload_bytes = tensor_dict_payload_bytes(state_dict_cpu, args)
             upload_traffic_round += client_upload_bytes
             per_client_upload_bytes.append(client_upload_bytes)
 
@@ -323,6 +425,8 @@ def main():
             del loader
             del train_loader
             del state_dict_cpu
+            del payload_dict
+            del reconstructed_state_dict
             del local_model
             cleanup_memory()
 
