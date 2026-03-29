@@ -12,6 +12,21 @@ def str2bool(value):
     raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
+def quantization_bits_type(value):
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in ("none", "no", "off", "false", "0"):
+        return None
+    try:
+        bits = int(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Quantization bits must be one of: none, 16, 8.") from exc
+    if bits not in (16, 8):
+        raise argparse.ArgumentTypeError("Quantization bits must be one of: none, 16, 8.")
+    return bits
+
+
 def get_config():
     parser = argparse.ArgumentParser(
         description="Federated Averaging Experiments")
@@ -45,10 +60,9 @@ def get_config():
     )
     parser.add_argument(
         "--quantization_bits",
-        type=int,
-        default=16,
-        choices=[16, 8, 4],
-        help="Post-sparsity quantization bits for client-to-server payload.",
+        type=quantization_bits_type,
+        default=None,
+        help="Post-sparsity quantization bits for client-to-server payload (none, 16, or 8).",
     )
     parser.add_argument("--wandb_enabled", type=str2bool, default=True)
 
