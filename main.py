@@ -66,6 +66,8 @@ def compressed_tensor_bytes(tensor, compression_type):
 
 
 def quantize_tensor(tensor, bits):
+    if bits is None:
+        return tensor.clone()
     if bits == 16:
         return tensor.to(torch.float16).to(dtype=tensor.dtype)
 
@@ -86,6 +88,8 @@ def quantize_tensor(tensor, bits):
 
 
 def quantize_tensor_for_transport(tensor, bits):
+    if bits is None:
+        return tensor.clone(), None
     if bits == 16:
         return tensor.to(torch.float16), None
     if bits not in (8, 4):
@@ -104,6 +108,8 @@ def quantize_tensor_for_transport(tensor, bits):
 
 
 def dequantize_tensor_from_transport(q_tensor, scale, bits, target_dtype):
+    if bits is None:
+        return q_tensor.to(dtype=target_dtype)
     if bits == 16:
         return q_tensor.to(dtype=target_dtype)
     if bits not in (8, 4):
@@ -183,6 +189,8 @@ def deserialize_tensor_payload(payload):
 
 def quantized_tensor_bytes(tensor, bits):
     numel = tensor.numel()
+    if bits is None:
+        return numel * tensor.element_size()
     if bits == 16:
         return numel * 2
     if bits == 8:
@@ -208,6 +216,8 @@ def compressed_quantized_tensor_bytes(tensor, compression_type, bits):
         csr = compress_csr(dense)
         packet = pack_csr(csr)
         nnz = csr.values.size
+        if bits is None:
+            return len(packet)
         if bits == 16:
             return len(packet) - (nnz * 2)
         if bits == 8:
