@@ -71,7 +71,12 @@ def decompress_csr(csr: CSRMatrix) -> np.ndarray:
     return dense
 
 
-_DTYPE_TO_CODE = {np.dtype("float32"): 1, np.dtype("float16"): 2, np.dtype("float64"): 3}
+_DTYPE_TO_CODE = {
+    np.dtype("float32"): 1,
+    np.dtype("float16"): 2,
+    np.dtype("float64"): 3,
+    np.dtype("int8"): 4,
+}
 _CODE_TO_DTYPE = {v: k for k, v in _DTYPE_TO_CODE.items()}
 
 
