@@ -129,6 +129,7 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking):
     if use_csr:
         csr_shape = tuple(cpu_tensor.shape)
         dense_2d = cpu_tensor if cpu_tensor.ndim == 2 else cpu_tensor.reshape(cpu_tensor.size(0), -1)
+        dense_numel = dense_2d.numel()
         csr = compress_csr(dense_2d.numpy())
         values = torch.from_numpy(csr.values)
         q_values, scale = quantize_tensor_for_transport(values, bits)
@@ -146,6 +147,8 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking):
             "bits": bits,
             "transport_dtype": transport_dtype,
             "orig_shape": csr_shape,
+            "nnz": int(csr.values.size),
+            "dense_numel": int(dense_numel),
         }, len(packet) + (4 if scale is not None else 0)
 
     q_tensor, scale = quantize_tensor_for_transport(cpu_tensor, bits)
@@ -185,6 +188,25 @@ def deserialize_tensor_payload(payload):
         return tensor.reshape(payload["orig_shape"]).to(dtype=target_dtype)
 
     raise ValueError(f"Unknown payload mode: {payload['mode']}")
+
+
+def estimate_payload_compression_flops(tensor, enable_sparse_masking):
+    if not (enable_sparse_masking and tensor.ndim in (2, 4)):
+        return 0
+    dense_2d = tensor if tensor.ndim == 2 else tensor.reshape(tensor.size(0), -1)
+    dense_numel = dense_2d.numel()
+    nnz = int(torch.count_nonzero(dense_2d).item())
+    # Dense scan + value/index materialization for non-zero entries.
+    return dense_numel + (2 * nnz)
+
+
+def estimate_payload_decompression_flops(payload):
+    if payload["mode"] != "csr":
+        return 0
+    dense_numel = int(payload.get("dense_numel", 0))
+    nnz = int(payload.get("nnz", 0))
+    # Zero-fill dense buffer + scatter each non-zero value.
+    return dense_numel + nnz
 
 
 def quantized_tensor_bytes(tensor, bits):
@@ -345,6 +367,8 @@ def main():
 
     total_upload_traffic = 0
     total_download_traffic = 0
+    total_compression_flops = 0
+    total_decompression_flops = 0
 
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
@@ -364,6 +388,8 @@ def main():
 
         aggregated_delta = None
         upload_traffic_round = 0
+        compression_flops_round = 0
+        decompression_flops_round = 0
         per_client_upload_bytes = []
         client_sparsity_metrics = []
 
@@ -395,6 +421,11 @@ def main():
                     args.enable_sparse_masking,
                 )
                 payload_dict[key] = payload
+                compression_flops_round += estimate_payload_compression_flops(
+                    tensor,
+                    args.enable_sparse_masking,
+                )
+                decompression_flops_round += estimate_payload_decompression_flops(payload)
                 reconstructed_state_dict[key] = deserialize_tensor_payload(payload)
                 client_upload_bytes += payload_size
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
@@ -500,8 +531,20 @@ def main():
         upload_traffic = upload_traffic_round
         total_upload_traffic += upload_traffic
         total_download_traffic += download_traffic
+        total_compression_flops += compression_flops_round
+        total_decompression_flops += decompression_flops_round
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
+        report["compression_flops"] = compression_flops_round
+        report["decompression_flops"] = decompression_flops_round
+        report["compression_plus_decompression_flops"] = (
+            compression_flops_round + decompression_flops_round
+        )
+        report["total_compression_flops"] = total_compression_flops
+        report["total_decompression_flops"] = total_decompression_flops
+        report["total_compression_plus_decompression_flops"] = (
+            total_compression_flops + total_decompression_flops
+        )
         report["upload_traffic_per_client"] = float(
             np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
         )
