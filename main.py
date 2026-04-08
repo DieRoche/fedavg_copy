@@ -170,8 +170,12 @@ def deserialize_tensor_payload(payload):
         csr_q, header = unpack_csr(payload["packet"])
         val_bits = header["val_bits"]
         if val_bits == 8:
-            bits = 8
-            scale = header["scale"]
+            if header.get("has_scale", False):
+                bits = 8
+                scale = header["scale"]
+            else:
+                bits = None
+                scale = None
         elif val_bits == 16:
             bits = 16
             scale = None

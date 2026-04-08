@@ -102,7 +102,8 @@ def pack_csr(csr: CSRMatrix, dynamic_quantization: bool = False, scale: float | 
     val_bits = _DTYPE_TO_VAL_BITS.get(dtype)
     if val_bits is None:
         raise ValueError(f"Unsupported dtype for CSR pack: {dtype}")
-    if val_bits != 8:
+    has_scale = bool(val_bits == 8 and scale is not None)
+    if not has_scale:
         scale = None
     n_rows, n_cols = csr.shape
     row_ptr = np.asarray(csr.row_ptr, dtype=np.uint32)
@@ -127,6 +128,7 @@ def pack_csr(csr: CSRMatrix, dynamic_quantization: bool = False, scale: float | 
         + int(nnz).to_bytes(4, "little")
         + bytes([int(val_bits)])
         + bytes([int(idx_bits)])
+        + bytes([1 if has_scale else 0])
         + int(len(values_bytes)).to_bytes(4, "little")
         + int(len(row_ptr_bytes)).to_bytes(4, "little")
         + int(len(col_bytes)).to_bytes(4, "little")
@@ -136,28 +138,31 @@ def pack_csr(csr: CSRMatrix, dynamic_quantization: bool = False, scale: float | 
 
 
 def unpack_csr(data: bytes) -> tuple[CSRMatrix, dict]:
-    if len(data) < 30:
+    if len(data) < 31:
         raise ValueError("Packet too short for CSR header")
     n_rows = int.from_bytes(data[0:4], "little")
     n_cols = int.from_bytes(data[4:8], "little")
     nnz = int.from_bytes(data[8:12], "little")
     val_bits = int(data[12])
     idx_bits = int(data[13])
-    values_nbytes = int.from_bytes(data[14:18], "little")
-    row_ptr_bytes_len = int.from_bytes(data[18:22], "little")
-    col_bytes_len = int.from_bytes(data[22:26], "little")
-    scale = float(np.frombuffer(data[26:30], dtype=np.float32, count=1)[0])
+    has_scale = bool(data[14])
+    values_nbytes = int.from_bytes(data[15:19], "little")
+    row_ptr_bytes_len = int.from_bytes(data[19:23], "little")
+    col_bytes_len = int.from_bytes(data[23:27], "little")
+    scale = float(np.frombuffer(data[27:31], dtype=np.float32, count=1)[0])
     value_dtype = _VAL_BITS_TO_DTYPE.get(val_bits)
     if value_dtype is None:
         raise ValueError("Unknown val_bits in CSR packet")
-    if val_bits == 8 and scale <= 0.0:
-        raise ValueError("int8 payload requires positive scale")
-    if val_bits != 8:
+    if has_scale and val_bits != 8:
+        raise ValueError("Scale can only be present for int8 payloads")
+    if has_scale and scale <= 0.0:
+        raise ValueError("Scaled int8 payload requires positive scale")
+    if not has_scale:
         scale = 0.0
     index_dtype = {16: np.uint16, 32: np.uint32}.get(idx_bits)
     if index_dtype is None:
         raise ValueError("Unknown idx_bits in CSR packet")
-    offset = 30
+    offset = 31
     values_end = offset + values_nbytes
     values = np.frombuffer(data[offset:values_end], dtype=value_dtype)
     offset = values_end
@@ -180,7 +185,12 @@ def unpack_csr(data: bytes) -> tuple[CSRMatrix, dict]:
         row_ptr=row_ptr.astype(np.uint32, copy=False),
         shape=(n_rows, n_cols),
     )
-    return csr, {"val_bits": val_bits, "idx_bits": idx_bits, "scale": scale}
+    return csr, {
+        "val_bits": val_bits,
+        "idx_bits": idx_bits,
+        "scale": scale,
+        "has_scale": has_scale,
+    }
 
 
 def compress_csc(matrix: np.ndarray | torch.Tensor) -> CSCMatrix:
