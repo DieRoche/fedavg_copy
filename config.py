@@ -64,6 +64,15 @@ def get_config():
         default=None,
         help="Post-sparsity quantization bits for client-to-server payload (none, 16, or 8).",
     )
+    parser.add_argument(
+        "--dynamic_quantization",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable lossless dynamic CSR index width selection (16-bit when safe, "
+            "otherwise 32-bit)."
+        ),
+    )
     parser.add_argument("--wandb_enabled", type=str2bool, default=True)
 
     parser.add_argument("--device", type=str, default="cuda")
