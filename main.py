@@ -356,11 +356,20 @@ def main():
 
     selected_clients = int(args.n_client * args.client_fraction)
     quantization_bits = getattr(args, "quantization_bits", None)
-    if args.enable_sparse_masking and args.sparsity_rate > 0.0:
+    sparse_masking_enabled = getattr(args, "enable_sparse_masking", False)
+    sparsity_rate = getattr(args, "sparsity_rate", None)
+    if sparse_masking_enabled and sparsity_rate is not None and sparsity_rate > 0.0:
         compression_prefix = f"GS{quantization_bits}" if quantization_bits is not None else "GS"
     else:
         compression_prefix = "fedavg"
-    run_name = f"{compression_prefix}_{args.dataset}_{args.model}_{selected_clients}cl"
+
+    run_name_parts = [compression_prefix, args.dataset, args.model]
+    if sparse_masking_enabled and sparsity_rate is not None and sparsity_rate > 0.0:
+        sparsity_pct = sparsity_rate * 100.0 if sparsity_rate <= 1.0 else sparsity_rate
+        sparsity_label = f"{sparsity_pct:g}"
+        run_name_parts.append(sparsity_label)
+    run_name_parts.append(f"{selected_clients}cl")
+    run_name = "_".join(run_name_parts)
 
     if args.wandb_enabled:
         wandb.init(
