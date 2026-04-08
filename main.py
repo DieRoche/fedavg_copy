@@ -143,6 +143,7 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking, dynamic_quanti
         return {
             "mode": "csr",
             "packet": packet,
+            "bits": bits,
             "transport_dtype": transport_dtype,
             "orig_shape": csr_shape,
             "nnz": int(csr.values.size),
@@ -244,6 +245,16 @@ def estimate_payload_decompression_flops(payload):
     dense_numel = int(payload.get("dense_numel", 0))
     nnz = int(payload.get("nnz", 0))
     bits = payload.get("bits", None)
+    if bits is None:
+        packet = payload.get("packet", b"")
+        if len(packet) >= 13:
+            val_bits = int(packet[12])
+            if val_bits == 8:
+                bits = 8
+            elif val_bits == 16:
+                bits = 16
+            else:
+                bits = None
     # Zero-fill dense buffer + scatter each non-zero value.
     csr_flops = dense_numel + nnz
     return csr_flops + estimate_dequantization_flops(nnz, bits)
@@ -329,11 +340,12 @@ def apply_sparse_mask(delta_dict, param_keys, args):
     abs_delta_flat = torch.cat([delta_dict[k].abs().reshape(-1) for k in param_keys])
     total_params = abs_delta_flat.numel()
 
-    gs_flops = total_params  # absolute-value scan
+    gs_flops = 0
 
     if not args.enable_sparse_masking or args.sparsity_rate == 0.0:
         mask_flat = torch.ones_like(abs_delta_flat, dtype=torch.bool)
     else:
+        gs_flops += total_params  # absolute-value scan
         if args.sparsity_rate >= 1.0:
             threshold = abs_delta_flat.max()
             gs_flops += total_params
