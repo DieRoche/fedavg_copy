@@ -71,110 +71,40 @@ def decompress_csr(csr: CSRMatrix) -> np.ndarray:
     return dense
 
 
-_DTYPE_TO_CODE = {
-    np.dtype("float32"): 1,
-    np.dtype("float16"): 2,
-    np.dtype("float64"): 3,
-    np.dtype("int8"): 4,
+_VAL_BITS_TO_DTYPE = {
+    8: np.dtype("int8"),
+    16: np.dtype("float16"),
+    32: np.dtype("float32"),
+    64: np.dtype("float64"),
 }
-_CODE_TO_DTYPE = {v: k for k, v in _DTYPE_TO_CODE.items()}
+_DTYPE_TO_VAL_BITS = {v: k for k, v in _VAL_BITS_TO_DTYPE.items()}
 
 
-def encode_uvarint(value: int) -> bytes:
-    if value < 0:
-        raise ValueError("uvarint cannot encode negative values")
-    out = bytearray()
-    v = int(value)
-    while True:
-        to_write = v & 0x7F
-        v >>= 7
-        if v:
-            out.append(to_write | 0x80)
-        else:
-            out.append(to_write)
-            break
-    return bytes(out)
+def _select_index_dtype(
+    col_indices: np.ndarray,
+    row_ptr: np.ndarray,
+    dynamic_quantization: bool,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    col_arr = np.asarray(col_indices, dtype=np.uint32)
+    row_arr = np.asarray(row_ptr, dtype=np.uint32)
+    if not dynamic_quantization:
+        return col_arr, row_arr, 32
+    col_max = int(col_arr.max(initial=0))
+    row_max = int(row_arr.max(initial=0))
+    if col_max <= 65535 and row_max <= 65535:
+        return col_arr.astype(np.uint16), row_arr.astype(np.uint16), 16
+    return col_arr, row_arr, 32
 
 
-def decode_uvarint_stream(data: bytes, count: int | None = None):
-    values = []
-    shift = 0
-    current = 0
-    idx = 0
-    for idx, byte in enumerate(data):
-        current |= (byte & 0x7F) << shift
-        if byte & 0x80:
-            shift += 7
-            continue
-        values.append(current)
-        if count is not None and len(values) >= count:
-            return values, idx + 1
-        current = 0
-        shift = 0
-    if count is not None and len(values) != count:
-        raise ValueError("Unexpected end of varint stream")
-    return values, idx + 1 if data else 0
-
-
-def _delta_encode_row_ptr(row_ptr: np.ndarray) -> np.ndarray:
-    if row_ptr[0] != 0:
-        raise ValueError("row_ptr must start at 0")
-    deltas = np.diff(row_ptr, prepend=row_ptr[0]).astype(np.uint32)
-    if np.any(deltas < 0):
-        raise ValueError("row_ptr deltas must be non-negative")
-    return deltas
-
-
-def _delta_decode_row_ptr(deltas: np.ndarray) -> np.ndarray:
-    return np.cumsum(deltas, dtype=np.uint32)
-
-
-def _delta_encode_col_indices(col_indices: np.ndarray, row_ptr: np.ndarray) -> np.ndarray:
-    deltas = []
-    for row_idx in range(len(row_ptr) - 1):
-        start = int(row_ptr[row_idx])
-        end = int(row_ptr[row_idx + 1])
-        row_cols = col_indices[start:end]
-        if row_cols.size == 0:
-            continue
-        if np.any(row_cols[1:] < row_cols[:-1]):
-            raise ValueError("col_indices must be nondecreasing within row")
-        row_deltas = np.diff(row_cols, prepend=row_cols[0]).astype(np.uint32)
-        if np.any(row_deltas < 0):
-            raise ValueError("col_indices deltas must be non-negative")
-        deltas.append(row_deltas)
-    if deltas:
-        return np.concatenate(deltas)
-    return np.array([], dtype=np.uint32)
-
-
-def _delta_decode_col_indices(deltas: np.ndarray, row_ptr: np.ndarray) -> np.ndarray:
-    col_indices = []
-    offset = 0
-    for row_idx in range(len(row_ptr) - 1):
-        start = int(row_ptr[row_idx])
-        end = int(row_ptr[row_idx + 1])
-        count = end - start
-        if count == 0:
-            continue
-        row_deltas = deltas[offset : offset + count]
-        if row_deltas.size != count:
-            raise ValueError("Invalid col delta stream length")
-        row_cols = np.cumsum(row_deltas, dtype=np.uint32)
-        col_indices.append(row_cols)
-        offset += count
-    if offset != deltas.size:
-        raise ValueError("Unused col delta entries")
-    if col_indices:
-        return np.concatenate(col_indices)
-    return np.array([], dtype=np.uint32)
-
-
-def pack_csr(csr: CSRMatrix) -> bytes:
+def pack_csr(csr: CSRMatrix, dynamic_quantization: bool = False, scale: float | None = None) -> bytes:
     values = np.asarray(csr.values)
     dtype = values.dtype
-    if dtype not in _DTYPE_TO_CODE:
+    val_bits = _DTYPE_TO_VAL_BITS.get(dtype)
+    if val_bits is None:
         raise ValueError(f"Unsupported dtype for CSR pack: {dtype}")
+    has_scale = bool(val_bits == 8 and scale is not None)
+    if not has_scale:
+        scale = None
     n_rows, n_cols = csr.shape
     row_ptr = np.asarray(csr.row_ptr, dtype=np.uint32)
     col_indices = np.asarray(csr.col_indices, dtype=np.uint32)
@@ -183,61 +113,84 @@ def pack_csr(csr: CSRMatrix) -> bytes:
         raise ValueError("row_ptr length mismatch")
     if row_ptr[0] != 0 or row_ptr[-1] != nnz:
         raise ValueError("row_ptr must start at 0 and end at nnz")
-    row_ptr_deltas = _delta_encode_row_ptr(row_ptr)
-    col_deltas = _delta_encode_col_indices(col_indices, row_ptr)
-    if col_deltas.size != nnz:
-        raise ValueError("col delta size mismatch")
-    row_ptr_bytes = b"".join(encode_uvarint(int(v)) for v in row_ptr_deltas)
-    col_bytes = b"".join(encode_uvarint(int(v)) for v in col_deltas)
+    col_enc, row_enc, idx_bits = _select_index_dtype(
+        col_indices,
+        row_ptr,
+        dynamic_quantization=dynamic_quantization,
+    )
+    row_ptr_bytes = row_enc.tobytes()
+    col_bytes = col_enc.tobytes()
     values_bytes = values.tobytes()
+    scale_value = float(scale) if scale is not None else 0.0
     header = (
         int(n_rows).to_bytes(4, "little")
         + int(n_cols).to_bytes(4, "little")
-        + bytes([_DTYPE_TO_CODE[dtype]])
         + int(nnz).to_bytes(4, "little")
+        + bytes([int(val_bits)])
+        + bytes([int(idx_bits)])
+        + bytes([1 if has_scale else 0])
         + int(len(values_bytes)).to_bytes(4, "little")
         + int(len(row_ptr_bytes)).to_bytes(4, "little")
         + int(len(col_bytes)).to_bytes(4, "little")
+        + np.float32(scale_value).tobytes()
     )
     return header + values_bytes + row_ptr_bytes + col_bytes
 
 
-def unpack_csr(data: bytes) -> CSRMatrix:
-    if len(data) < 25:
+def unpack_csr(data: bytes) -> tuple[CSRMatrix, dict]:
+    if len(data) < 31:
         raise ValueError("Packet too short for CSR header")
     n_rows = int.from_bytes(data[0:4], "little")
     n_cols = int.from_bytes(data[4:8], "little")
-    dtype_code = data[8]
-    nnz = int.from_bytes(data[9:13], "little")
-    values_nbytes = int.from_bytes(data[13:17], "little")
-    row_ptr_bytes_len = int.from_bytes(data[17:21], "little")
-    col_bytes_len = int.from_bytes(data[21:25], "little")
-    dtype = _CODE_TO_DTYPE.get(dtype_code)
-    if dtype is None:
-        raise ValueError("Unknown dtype code")
-    offset = 25
+    nnz = int.from_bytes(data[8:12], "little")
+    val_bits = int(data[12])
+    idx_bits = int(data[13])
+    has_scale = bool(data[14])
+    values_nbytes = int.from_bytes(data[15:19], "little")
+    row_ptr_bytes_len = int.from_bytes(data[19:23], "little")
+    col_bytes_len = int.from_bytes(data[23:27], "little")
+    scale = float(np.frombuffer(data[27:31], dtype=np.float32, count=1)[0])
+    value_dtype = _VAL_BITS_TO_DTYPE.get(val_bits)
+    if value_dtype is None:
+        raise ValueError("Unknown val_bits in CSR packet")
+    if has_scale and val_bits != 8:
+        raise ValueError("Scale can only be present for int8 payloads")
+    if has_scale and scale <= 0.0:
+        raise ValueError("Scaled int8 payload requires positive scale")
+    if not has_scale:
+        scale = 0.0
+    index_dtype = {16: np.uint16, 32: np.uint32}.get(idx_bits)
+    if index_dtype is None:
+        raise ValueError("Unknown idx_bits in CSR packet")
+    offset = 31
     values_end = offset + values_nbytes
-    values = np.frombuffer(data[offset:values_end], dtype=dtype)
+    values = np.frombuffer(data[offset:values_end], dtype=value_dtype)
     offset = values_end
     row_ptr_bytes = data[offset : offset + row_ptr_bytes_len]
     offset += row_ptr_bytes_len
     col_bytes = data[offset : offset + col_bytes_len]
-    row_ptr_deltas, used = decode_uvarint_stream(row_ptr_bytes, count=n_rows + 1)
-    if used != row_ptr_bytes_len:
-        raise ValueError("row_ptr bytes length mismatch")
-    row_ptr = _delta_decode_row_ptr(np.array(row_ptr_deltas, dtype=np.uint32))
+    if len(data) != offset + col_bytes_len:
+        raise ValueError("Packet length mismatch")
+    row_ptr = np.frombuffer(row_ptr_bytes, dtype=index_dtype).astype(np.uint32, copy=False)
+    col_indices = np.frombuffer(col_bytes, dtype=index_dtype).astype(np.uint32, copy=False)
+    if row_ptr.size != n_rows + 1:
+        raise ValueError("row_ptr length mismatch")
     if row_ptr[0] != 0 or row_ptr[-1] != nnz:
         raise ValueError("row_ptr does not match nnz")
-    col_deltas, used = decode_uvarint_stream(col_bytes, count=nnz)
-    if used != col_bytes_len:
-        raise ValueError("col bytes length mismatch")
-    col_indices = _delta_decode_col_indices(np.array(col_deltas, dtype=np.uint32), row_ptr)
-    return CSRMatrix(
+    if col_indices.size != nnz:
+        raise ValueError("col_indices length mismatch")
+    csr = CSRMatrix(
         values=values,
-        col_indices=col_indices.astype(np.uint32, copy=False),
+        col_indices=col_indices,
         row_ptr=row_ptr.astype(np.uint32, copy=False),
         shape=(n_rows, n_cols),
     )
+    return csr, {
+        "val_bits": val_bits,
+        "idx_bits": idx_bits,
+        "scale": scale,
+        "has_scale": has_scale,
+    }
 
 
 def compress_csc(matrix: np.ndarray | torch.Tensor) -> CSCMatrix:

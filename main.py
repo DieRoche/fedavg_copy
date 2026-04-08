@@ -121,7 +121,7 @@ def quantize_state_dict(state_dict, bits):
     return {k: quantize_tensor(v, bits) for k, v in state_dict.items()}
 
 
-def serialize_tensor_payload(tensor, bits, enable_sparse_masking):
+def serialize_tensor_payload(tensor, bits, enable_sparse_masking, dynamic_quantization=False):
     cpu_tensor = tensor.detach().cpu()
     transport_dtype = str(cpu_tensor.dtype)
 
@@ -139,17 +139,15 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking):
             row_ptr=csr.row_ptr,
             shape=csr.shape,
         )
-        packet = pack_csr(q_csr)
+        packet = pack_csr(q_csr, dynamic_quantization=dynamic_quantization, scale=scale)
         return {
             "mode": "csr",
             "packet": packet,
-            "scale": scale,
-            "bits": bits,
             "transport_dtype": transport_dtype,
             "orig_shape": csr_shape,
             "nnz": int(csr.values.size),
             "dense_numel": int(dense_numel),
-        }, len(packet) + (4 if scale is not None else 0)
+        }, len(packet)
 
     q_tensor, scale = quantize_tensor_for_transport(cpu_tensor, bits)
     payload = {
@@ -165,13 +163,29 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking):
 
 
 def deserialize_tensor_payload(payload):
-    bits = payload["bits"]
+    bits = payload.get("bits", None)
     target_dtype = getattr(torch, payload["transport_dtype"].split(".")[-1])
 
     if payload["mode"] == "csr":
-        csr_q = unpack_csr(payload["packet"])
+        csr_q, header = unpack_csr(payload["packet"])
+        val_bits = header["val_bits"]
+        if val_bits == 8:
+            if header.get("has_scale", False):
+                bits = 8
+                scale = header["scale"]
+            else:
+                bits = None
+                scale = None
+        elif val_bits == 16:
+            bits = 16
+            scale = None
+        elif val_bits in (32, 64):
+            bits = None
+            scale = None
+        else:
+            raise ValueError(f"Unsupported val_bits in packet: {val_bits}")
         q_values = torch.from_numpy(csr_q.values.copy())
-        values = dequantize_tensor_from_transport(q_values, payload["scale"], bits, target_dtype).numpy()
+        values = dequantize_tensor_from_transport(q_values, scale, bits, target_dtype).numpy()
         csr_deq = type(csr_q)(
             values=values,
             col_indices=csr_q.col_indices,
@@ -220,7 +234,7 @@ def quantized_tensor_bytes(tensor, bits):
     raise ValueError(f"Unsupported quantization bits: {bits}")
 
 
-def compressed_quantized_tensor_bytes(tensor, compression_type, bits):
+def compressed_quantized_tensor_bytes(tensor, compression_type, bits, dynamic_quantization=False):
     if tensor.ndim == 1:
         return quantized_tensor_bytes(tensor, bits)
 
@@ -234,15 +248,20 @@ def compressed_quantized_tensor_bytes(tensor, compression_type, bits):
 
     if compression_type == "CSR":
         csr = compress_csr(dense)
-        packet = pack_csr(csr)
-        nnz = csr.values.size
-        if bits is None:
-            return len(packet)
-        if bits == 16:
-            return len(packet) - (nnz * 2)
-        if bits == 8:
-            return len(packet) - (nnz * 3) + 4
-        raise ValueError(f"Unsupported quantization bits: {bits}")
+        values = torch.from_numpy(csr.values)
+        q_values, scale = quantize_tensor_for_transport(values, bits)
+        q_csr = type(csr)(
+            values=q_values.cpu().numpy(),
+            col_indices=csr.col_indices,
+            row_ptr=csr.row_ptr,
+            shape=csr.shape,
+        )
+        packet = pack_csr(
+            q_csr,
+            dynamic_quantization=dynamic_quantization,
+            scale=scale,
+        )
+        return len(packet)
 
     raise ValueError(f"Unknown compression type: {compression_type}")
 
@@ -254,6 +273,7 @@ def tensor_dict_payload_bytes(tensor_dict, args):
                 tensor,
                 args.sparsity_compression,
                 args.quantization_bits,
+                args.dynamic_quantization,
             )
             for tensor in tensor_dict.values()
         )
@@ -419,6 +439,7 @@ def main():
                     tensor,
                     args.quantization_bits,
                     args.enable_sparse_masking,
+                    args.dynamic_quantization,
                 )
                 payload_dict[key] = payload
                 compression_flops_round += estimate_payload_compression_flops(
