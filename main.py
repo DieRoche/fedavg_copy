@@ -204,23 +204,49 @@ def deserialize_tensor_payload(payload):
     raise ValueError(f"Unknown payload mode: {payload['mode']}")
 
 
-def estimate_payload_compression_flops(tensor, enable_sparse_masking):
-    if not (enable_sparse_masking and tensor.ndim in (2, 4)):
+def estimate_quantization_flops(numel, bits):
+    if bits is None:
         return 0
+    if bits == 16:
+        return int(numel)
+    if bits == 8:
+        # abs/max + scale/div + round/clamp (coarse estimate).
+        return int(4 * numel)
+    raise ValueError(f"Unsupported quantization bits: {bits}")
+
+
+def estimate_dequantization_flops(numel, bits):
+    if bits is None:
+        return 0
+    if bits == 16:
+        return int(numel)
+    if bits == 8:
+        # one multiply per value.
+        return int(numel)
+    raise ValueError(f"Unsupported quantization bits: {bits}")
+
+
+def estimate_payload_compression_flops(tensor, enable_sparse_masking, bits):
+    if not (enable_sparse_masking and tensor.ndim in (2, 4)):
+        return estimate_quantization_flops(tensor.numel(), bits)
     dense_2d = tensor if tensor.ndim == 2 else tensor.reshape(tensor.size(0), -1)
     dense_numel = dense_2d.numel()
     nnz = int(torch.count_nonzero(dense_2d).item())
     # Dense scan + value/index materialization for non-zero entries.
-    return dense_numel + (2 * nnz)
+    csr_flops = dense_numel + (2 * nnz)
+    return csr_flops + estimate_quantization_flops(nnz, bits)
 
 
 def estimate_payload_decompression_flops(payload):
     if payload["mode"] != "csr":
-        return 0
+        bits = payload.get("bits", None)
+        return estimate_dequantization_flops(payload["q_tensor"].numel(), bits)
     dense_numel = int(payload.get("dense_numel", 0))
     nnz = int(payload.get("nnz", 0))
+    bits = payload.get("bits", None)
     # Zero-fill dense buffer + scatter each non-zero value.
-    return dense_numel + nnz
+    csr_flops = dense_numel + nnz
+    return csr_flops + estimate_dequantization_flops(nnz, bits)
 
 
 def quantized_tensor_bytes(tensor, bits):
@@ -303,14 +329,19 @@ def apply_sparse_mask(delta_dict, param_keys, args):
     abs_delta_flat = torch.cat([delta_dict[k].abs().reshape(-1) for k in param_keys])
     total_params = abs_delta_flat.numel()
 
+    gs_flops = total_params  # absolute-value scan
+
     if not args.enable_sparse_masking or args.sparsity_rate == 0.0:
         mask_flat = torch.ones_like(abs_delta_flat, dtype=torch.bool)
     else:
         if args.sparsity_rate >= 1.0:
             threshold = abs_delta_flat.max()
+            gs_flops += total_params
         else:
             threshold = torch.quantile(abs_delta_flat, args.sparsity_rate)
+            gs_flops += total_params
         mask_flat = abs_delta_flat >= threshold
+        gs_flops += total_params
 
         density = mask_flat.float().mean().item()
         if density < args.sparsity_min_density:
@@ -319,6 +350,7 @@ def apply_sparse_mask(delta_dict, param_keys, args):
             topk_values, _ = torch.topk(abs_delta_flat, k)
             threshold = topk_values[-1]
             mask_flat = abs_delta_flat >= threshold
+            gs_flops += total_params + k
 
     density = mask_flat.float().mean().item()
     sparsity = 1.0 - density
@@ -345,6 +377,7 @@ def apply_sparse_mask(delta_dict, param_keys, args):
         "sparsity": sparsity,
         "l2_norm_delta": l2_norm_delta,
         "l2_norm_delta_sparse": l2_norm_delta_sparse,
+        "gs_flops": int(gs_flops),
     }
 
     assert metrics["nonzero_params"] <= metrics["total_params"], "Mask overflow"
@@ -398,6 +431,7 @@ def main():
     total_download_traffic = 0
     total_compression_flops = 0
     total_decompression_flops = 0
+    total_gs_flops = 0
 
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
@@ -419,6 +453,7 @@ def main():
         upload_traffic_round = 0
         compression_flops_round = 0
         decompression_flops_round = 0
+        gs_flops_round = 0
         per_client_upload_bytes = []
         client_sparsity_metrics = []
 
@@ -454,6 +489,7 @@ def main():
                 compression_flops_round += estimate_payload_compression_flops(
                     tensor,
                     args.enable_sparse_masking,
+                    args.quantization_bits,
                 )
                 decompression_flops_round += estimate_payload_decompression_flops(payload)
                 reconstructed_state_dict[key] = deserialize_tensor_payload(payload)
@@ -474,6 +510,7 @@ def main():
             metrics["sparsity"] = metrics.get("sparsity", 0.0)
             assert abs(metrics["density"] + metrics["sparsity"] - 1.0) < 1e-6
             client_sparsity_metrics.append(metrics)
+            gs_flops_round += metrics.get("gs_flops", 0)
 
             if args.wandb_enabled:
                 wandb.log(
@@ -563,17 +600,26 @@ def main():
         total_download_traffic += download_traffic
         total_compression_flops += compression_flops_round
         total_decompression_flops += decompression_flops_round
+        total_gs_flops += gs_flops_round
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
         report["compression_flops"] = compression_flops_round
         report["decompression_flops"] = decompression_flops_round
+        report["gs_flops"] = gs_flops_round
         report["compression_plus_decompression_flops"] = (
             compression_flops_round + decompression_flops_round
         )
+        report["gs_plus_compression_plus_decompression_flops"] = (
+            gs_flops_round + compression_flops_round + decompression_flops_round
+        )
         report["total_compression_flops"] = total_compression_flops
         report["total_decompression_flops"] = total_decompression_flops
+        report["total_gs_flops"] = total_gs_flops
         report["total_compression_plus_decompression_flops"] = (
             total_compression_flops + total_decompression_flops
+        )
+        report["total_gs_plus_compression_plus_decompression_flops"] = (
+            total_gs_flops + total_compression_flops + total_decompression_flops
         )
         report["upload_traffic_per_client"] = float(
             np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
