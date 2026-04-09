@@ -444,6 +444,7 @@ def main():
     total_compression_flops = 0
     total_decompression_flops = 0
     total_gs_flops = 0
+    total_flops = 0
 
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
@@ -613,25 +614,28 @@ def main():
         total_compression_flops += compression_flops_round
         total_decompression_flops += decompression_flops_round
         total_gs_flops += gs_flops_round
+        round_flops_compression = compression_flops_round + decompression_flops_round
+        round_flops = gs_flops_round + round_flops_compression
+        total_flops += round_flops
+        total_flops_compression = total_compression_flops + total_decompression_flops
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
         report["compression_flops"] = compression_flops_round
         report["decompression_flops"] = decompression_flops_round
         report["gs_flops"] = gs_flops_round
-        report["compression_plus_decompression_flops"] = (
-            compression_flops_round + decompression_flops_round
-        )
+        report["compression_plus_decompression_flops"] = round_flops_compression
+        report["round_flops"] = round_flops
         report["gs_plus_compression_plus_decompression_flops"] = (
-            gs_flops_round + compression_flops_round + decompression_flops_round
+            round_flops
         )
         report["total_compression_flops"] = total_compression_flops
         report["total_decompression_flops"] = total_decompression_flops
         report["total_gs_flops"] = total_gs_flops
-        report["total_compression_plus_decompression_flops"] = (
-            total_compression_flops + total_decompression_flops
-        )
+        report["total_compression_plus_decompression_flops"] = total_flops_compression
+        report["total_flops_compression"] = total_flops_compression
+        report["total_flops"] = total_flops
         report["total_gs_plus_compression_plus_decompression_flops"] = (
-            total_gs_flops + total_compression_flops + total_decompression_flops
+            total_flops
         )
         report["upload_traffic_per_client"] = float(
             np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
