@@ -449,12 +449,14 @@ def main():
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
         selected = random.sample(range(n_clients), m)
+        selected_count = len(selected)
         report = {}
 
         cos = []
         training_loss = []
 
         selected_sizes = [len(client_train_data[idx]) for idx in selected]
+        assert len(selected_sizes) == selected_count
         total_size = sum(selected_sizes)
 
         global_params = dict_to_tensor(global_model.state_dict())
@@ -471,6 +473,7 @@ def main():
         client_sparsity_metrics = []
 
         for client_order, idx in enumerate(selected):
+            # Only active/selected clients receive the current server global model.
             local_model = copy.deepcopy(global_model)
             loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=True)
             state_dict = client_update(local_model, loader, args.n_client_epoch, device, args.lr)
@@ -607,7 +610,8 @@ def main():
         report["round"] = round_idx + 1
 
         model_size_bytes = tensor_dict_bytes(global_state)
-        download_traffic = model_size_bytes * args.n_client
+        # The global model is only transmitted to clients selected in this round.
+        download_traffic = model_size_bytes * selected_count
         upload_traffic = upload_traffic_round
         total_upload_traffic += upload_traffic
         total_download_traffic += download_traffic
@@ -640,6 +644,7 @@ def main():
         report["upload_traffic_per_client"] = float(
             np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
         )
+        report["active_clients"] = selected_count
         report["overall_traffic"] = total_upload_traffic + total_download_traffic
 
         if args.wandb_enabled:
