@@ -214,6 +214,8 @@ def _huffman_encode_int_array(symbols: np.ndarray) -> tuple[bytes, bytes, int]:
     arr = np.asarray(symbols, dtype=np.int32)
     lengths = _huffman_build_code_lengths(arr)
     length_items = [(sym, ln) for sym, ln in lengths.items()]
+    if len(length_items) > 65535:
+        raise ValueError("Huffman symbol cardinality exceeds uint16 table capacity.")
     canonical = _canonical_codes_from_lengths(length_items)
 
     table = bytearray()
@@ -375,15 +377,16 @@ def pack_csr(
     col_codec = _COL_CODEC_RAW_DELTA
     ptr_codec = _PTR_CODEC_RAW_DELTA
     huffman_table = b""
-    if col_ent["viable"] and int(col_delta_t.min(initial=0)) >= -32768 and int(col_delta_t.max(initial=0)) <= 32767:
-        huffman_table, col_payload, _ = _huffman_encode_int_array(col_delta_t.astype(np.int32))
-        if len(huffman_table) + len(col_payload) < col_delta_t.nbytes:
+    col_payload = col_delta_t.tobytes()
+    col_unique_symbols = int(np.unique(col_delta_t).size)
+    col_symbol_count_fits = col_unique_symbols <= 65535
+    if col_ent["viable"] and col_symbol_count_fits and int(col_delta_t.min(initial=0)) >= -32768 and int(col_delta_t.max(initial=0)) <= 32767:
+        huffman_table, huffman_payload, _ = _huffman_encode_int_array(col_delta_t.astype(np.int32))
+        if len(huffman_table) + len(huffman_payload) < col_delta_t.nbytes:
             col_codec = _COL_CODEC_DELTA_HUFFMAN
+            col_payload = huffman_payload
         else:
-            col_payload = col_delta_t.tobytes()
             huffman_table = b""
-    else:
-        col_payload = col_delta_t.tobytes()
 
     if ptr_ent["viable"] and int(row_delta_t.min(initial=0)) >= -32768 and int(row_delta_t.max(initial=0)) <= 32767:
         rle_payload, _ = _rle_encode_int_array(row_delta_t.astype(np.int32))
@@ -395,8 +398,6 @@ def pack_csr(
     else:
         row_ptr_bytes = row_delta_t.tobytes()
 
-    if col_codec == _COL_CODEC_RAW_DELTA:
-        col_payload = col_delta_t.tobytes()
     values_bytes = values.tobytes()
     scale_value = float(scale) if scale is not None else 0.0
     header_len = 45
@@ -432,6 +433,8 @@ def pack_csr(
         "ptr_entropy_viable": bool(ptr_ent["viable"]),
         "col_entropy_recommendation": col_ent["recommendation"],
         "ptr_entropy_recommendation": ptr_ent["recommendation"],
+        "col_unique_symbols": col_unique_symbols,
+        "col_symbol_count_fits_huffman_header": bool(col_symbol_count_fits),
         "raw_col_delta_bytes": int(col_delta_t.nbytes),
         "raw_row_delta_bytes": int(row_delta_t.nbytes),
         "compression_flops_codec": int(col_delta.size + row_delta.size + (4 * (col_delta.size + row_delta.size))),

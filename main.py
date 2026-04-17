@@ -666,9 +666,10 @@ def main():
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
         report["round"] = round_idx + 1
 
-        # The global model is only transmitted to clients selected in this round.
+        # The global model is transmitted via in-memory model copy for selected clients;
+        # no downlink packet serialization path exists in this loop.
         raw_download_per_client = tensor_dict_bytes(global_state)
-        compressed_download_per_client = tensor_dict_payload_bytes(global_state, args)
+        compressed_download_per_client = raw_download_per_client
         download_traffic = compressed_download_per_client * selected_count
         raw_download_traffic = raw_download_per_client * selected_count
         upload_traffic = upload_traffic_round
