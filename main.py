@@ -139,7 +139,21 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking, dynamic_quanti
             row_ptr=csr.row_ptr,
             shape=csr.shape,
         )
-        packet = pack_csr(q_csr, dynamic_quantization=dynamic_quantization, scale=scale)
+        packet, packet_stats = pack_csr(
+            q_csr,
+            dynamic_quantization=dynamic_quantization,
+            scale=scale,
+            return_stats=True,
+        )
+        raw_values_bytes = quantized_tensor_bytes(values, bits)
+        raw_col_bytes = int(csr.col_indices.size * np.dtype(np.int32).itemsize)
+        raw_row_bytes = int(csr.row_ptr.size * np.dtype(np.int32).itemsize)
+        raw_total_bytes = raw_values_bytes + raw_col_bytes + raw_row_bytes
+        packet_stats["raw_total_bytes"] = int(raw_total_bytes)
+        packet_stats["compressed_total_bytes"] = int(len(packet))
+        packet_stats["total_compression_ratio"] = float(
+            raw_total_bytes / len(packet) if len(packet) > 0 else 1.0
+        )
         return {
             "mode": "csr",
             "packet": packet,
@@ -148,7 +162,8 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking, dynamic_quanti
             "orig_shape": csr_shape,
             "nnz": int(csr.values.size),
             "dense_numel": int(dense_numel),
-        }, len(packet)
+            "packet_stats": packet_stats,
+        }, len(packet), raw_total_bytes, packet_stats
 
     q_tensor, scale = quantize_tensor_for_transport(cpu_tensor, bits)
     payload = {
@@ -160,7 +175,19 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking, dynamic_quanti
         "orig_shape": tuple(cpu_tensor.shape),
     }
     payload_bytes = quantized_tensor_bytes(cpu_tensor, bits)
-    return payload, payload_bytes
+    dense_stats = {
+        "header_bytes": 0,
+        "huffman_table_bytes": 0,
+        "values_payload_bytes": payload_bytes,
+        "col_payload_bytes": 0,
+        "row_ptr_payload_bytes": 0,
+        "col_codec": -1,
+        "ptr_codec": -1,
+        "col_entropy_viable": False,
+        "ptr_entropy_viable": False,
+        "compression_flops_codec": 0,
+    }
+    return payload, payload_bytes, payload_bytes, dense_stats
 
 
 def deserialize_tensor_payload(payload):
@@ -169,6 +196,7 @@ def deserialize_tensor_payload(payload):
 
     if payload["mode"] == "csr":
         csr_q, header = unpack_csr(payload["packet"])
+        payload["packet_stats"] = {**payload.get("packet_stats", {}), **header}
         val_bits = header["val_bits"]
         if val_bits == 8:
             if header.get("has_scale", False):
@@ -227,7 +255,7 @@ def estimate_dequantization_flops(numel, bits):
     raise ValueError(f"Unsupported quantization bits: {bits}")
 
 
-def estimate_payload_compression_flops(tensor, enable_sparse_masking, bits):
+def estimate_payload_compression_flops(tensor, enable_sparse_masking, bits, payload_stats=None):
     if not (enable_sparse_masking and tensor.ndim in (2, 4)):
         return estimate_quantization_flops(tensor.numel(), bits)
     dense_2d = tensor if tensor.ndim == 2 else tensor.reshape(tensor.size(0), -1)
@@ -235,7 +263,8 @@ def estimate_payload_compression_flops(tensor, enable_sparse_masking, bits):
     nnz = int(torch.count_nonzero(dense_2d).item())
     # Dense scan + value/index materialization for non-zero entries.
     csr_flops = dense_numel + (2 * nnz)
-    return csr_flops + estimate_quantization_flops(nnz, bits)
+    codec_flops = int((payload_stats or {}).get("compression_flops_codec", 0))
+    return csr_flops + estimate_quantization_flops(nnz, bits) + codec_flops
 
 
 def estimate_payload_decompression_flops(payload):
@@ -257,7 +286,9 @@ def estimate_payload_decompression_flops(payload):
                 bits = None
     # Zero-fill dense buffer + scatter each non-zero value.
     csr_flops = dense_numel + nnz
-    return csr_flops + estimate_dequantization_flops(nnz, bits)
+    packet_stats = payload.get("packet_stats", {})
+    codec_flops = int(packet_stats.get("decompression_flops_codec", 0))
+    return csr_flops + estimate_dequantization_flops(nnz, bits) + codec_flops
 
 
 def quantized_tensor_bytes(tensor, bits):
@@ -441,6 +472,8 @@ def main():
 
     total_upload_traffic = 0
     total_download_traffic = 0
+    total_raw_upload_traffic = 0
+    total_raw_download_traffic = 0
     total_compression_flops = 0
     total_decompression_flops = 0
     total_gs_flops = 0
@@ -466,11 +499,19 @@ def main():
 
         aggregated_delta = None
         upload_traffic_round = 0
+        raw_upload_traffic_round = 0
         compression_flops_round = 0
         decompression_flops_round = 0
         gs_flops_round = 0
         per_client_upload_bytes = []
+        per_client_upload_raw_bytes = []
         client_sparsity_metrics = []
+        codec_col_huffman_count = 0
+        codec_col_raw_count = 0
+        codec_ptr_rle_count = 0
+        codec_ptr_raw_count = 0
+        entropy_col_viable_count = 0
+        entropy_ptr_viable_count = 0
 
         for client_order, idx in enumerate(selected):
             # Only active/selected clients receive the current server global model.
@@ -494,8 +535,9 @@ def main():
             payload_dict = {}
             reconstructed_state_dict = {}
             client_upload_bytes = 0
+            client_upload_raw_bytes = 0
             for key, tensor in state_dict_cpu.items():
-                payload, payload_size = serialize_tensor_payload(
+                payload, payload_size, raw_size, payload_stats = serialize_tensor_payload(
                     tensor,
                     args.quantization_bits,
                     args.enable_sparse_masking,
@@ -506,10 +548,23 @@ def main():
                     tensor,
                     args.enable_sparse_masking,
                     args.quantization_bits,
+                    payload_stats,
                 )
-                decompression_flops_round += estimate_payload_decompression_flops(payload)
                 reconstructed_state_dict[key] = deserialize_tensor_payload(payload)
+                decompression_flops_round += estimate_payload_decompression_flops(payload)
                 client_upload_bytes += payload_size
+                client_upload_raw_bytes += raw_size
+                if payload.get("mode") == "csr":
+                    if payload_stats.get("col_codec", -1) == 1:
+                        codec_col_huffman_count += 1
+                    else:
+                        codec_col_raw_count += 1
+                    if payload_stats.get("ptr_codec", -1) == 1:
+                        codec_ptr_rle_count += 1
+                    else:
+                        codec_ptr_raw_count += 1
+                    entropy_col_viable_count += int(bool(payload_stats.get("col_entropy_viable", False)))
+                    entropy_ptr_viable_count += int(bool(payload_stats.get("ptr_entropy_viable", False)))
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
 
             if aggregated_delta is None:
@@ -519,7 +574,9 @@ def main():
                     aggregated_delta[key] += reconstructed_state_dict[key] * weight
 
             upload_traffic_round += client_upload_bytes
+            raw_upload_traffic_round += client_upload_raw_bytes
             per_client_upload_bytes.append(client_upload_bytes)
+            per_client_upload_raw_bytes.append(client_upload_raw_bytes)
 
             metrics.update({"client_id": idx, "round": round_idx + 1})
             metrics["density"] = metrics.get("density", 0.0)
@@ -609,12 +666,18 @@ def main():
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
         report["round"] = round_idx + 1
 
-        model_size_bytes = tensor_dict_bytes(global_state)
-        # The global model is only transmitted to clients selected in this round.
-        download_traffic = model_size_bytes * selected_count
+        # The global model is transmitted via in-memory model copy for selected clients;
+        # no downlink packet serialization path exists in this loop.
+        raw_download_per_client = tensor_dict_bytes(global_state)
+        compressed_download_per_client = raw_download_per_client
+        download_traffic = compressed_download_per_client * selected_count
+        raw_download_traffic = raw_download_per_client * selected_count
         upload_traffic = upload_traffic_round
+        raw_upload_traffic = raw_upload_traffic_round
         total_upload_traffic += upload_traffic
         total_download_traffic += download_traffic
+        total_raw_upload_traffic += raw_upload_traffic
+        total_raw_download_traffic += raw_download_traffic
         total_compression_flops += compression_flops_round
         total_decompression_flops += decompression_flops_round
         total_gs_flops += gs_flops_round
@@ -624,8 +687,20 @@ def main():
         total_flops_compression = total_compression_flops + total_decompression_flops
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
+        report["total_traffic"] = upload_traffic + download_traffic
+        report["raw_upload_traffic"] = raw_upload_traffic
+        report["raw_download_traffic"] = raw_download_traffic
+        report["total_raw_traffic"] = raw_upload_traffic + raw_download_traffic
+        report["upload_compression_ratio"] = float(raw_upload_traffic / upload_traffic) if upload_traffic else 1.0
+        report["download_compression_ratio"] = float(raw_download_traffic / download_traffic) if download_traffic else 1.0
+        report["overall_compression_ratio"] = (
+            float((raw_upload_traffic + raw_download_traffic) / (upload_traffic + download_traffic))
+            if (upload_traffic + download_traffic) > 0
+            else 1.0
+        )
         report["compression_flops"] = compression_flops_round
         report["decompression_flops"] = decompression_flops_round
+        report["total_codec_flops"] = round_flops_compression
         report["gs_flops"] = gs_flops_round
         report["compression_plus_decompression_flops"] = round_flops_compression
         report["round_flops"] = round_flops
@@ -634,6 +709,7 @@ def main():
         )
         report["total_compression_flops"] = total_compression_flops
         report["total_decompression_flops"] = total_decompression_flops
+        report["cumulative_total_codec_flops"] = total_flops_compression
         report["total_gs_flops"] = total_gs_flops
         report["total_compression_plus_decompression_flops"] = total_flops_compression
         report["total_flops_compression"] = total_flops_compression
@@ -644,8 +720,23 @@ def main():
         report["upload_traffic_per_client"] = float(
             np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
         )
+        report["raw_upload_traffic_per_client"] = float(
+            np.mean(per_client_upload_raw_bytes) if per_client_upload_raw_bytes else 0.0
+        )
         report["active_clients"] = selected_count
         report["overall_traffic"] = total_upload_traffic + total_download_traffic
+        report["cumulative_upload_traffic"] = total_upload_traffic
+        report["cumulative_download_traffic"] = total_download_traffic
+        report["cumulative_overall_traffic"] = total_upload_traffic + total_download_traffic
+        report["cumulative_raw_upload_traffic"] = total_raw_upload_traffic
+        report["cumulative_raw_download_traffic"] = total_raw_download_traffic
+        report["cumulative_raw_overall_traffic"] = total_raw_upload_traffic + total_raw_download_traffic
+        report["codec/col_huffman_count"] = codec_col_huffman_count
+        report["codec/col_raw_count"] = codec_col_raw_count
+        report["codec/ptr_rle_count"] = codec_ptr_rle_count
+        report["codec/ptr_raw_count"] = codec_ptr_raw_count
+        report["entropy/col_viable_count"] = entropy_col_viable_count
+        report["entropy/ptr_viable_count"] = entropy_ptr_viable_count
 
         if args.wandb_enabled:
             wandb.log(report, step=round_idx + 1, commit=True)
