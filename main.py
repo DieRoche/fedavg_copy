@@ -47,6 +47,53 @@ def tensor_dict_bytes(tensor_dict):
     return sum(t.element_size() * t.nelement() for t in tensor_dict.values())
 
 
+def compute_upload_traffic_for_round(per_client_upload_bytes):
+    return int(sum(per_client_upload_bytes))
+
+
+def compute_download_traffic_for_round(server_payload_bytes, active_clients):
+    return int(server_payload_bytes) * int(active_clients)
+
+
+def compute_overall_traffic_for_round(upload_traffic, download_traffic):
+    return int(upload_traffic) + int(download_traffic)
+
+
+def estimate_local_training_flops(num_model_params, train_samples_processed):
+    # Coarse proxy: forward + backward + parameter update per sample.
+    flops_per_sample = 6 * int(num_model_params)
+    return int(train_samples_processed) * flops_per_sample
+
+
+def estimate_evaluation_flops(num_model_params, eval_samples_processed):
+    # Coarse proxy: forward pass only per sample.
+    flops_per_sample = 2 * int(num_model_params)
+    return int(eval_samples_processed) * flops_per_sample
+
+
+def estimate_aggregation_flops(total_params, active_clients):
+    if active_clients <= 0:
+        return 0
+    # Weighted sum across client deltas + global model update.
+    weighted_sum_flops = total_params * (1 + max(0, active_clients - 1) * 2)
+    global_update_flops = total_params
+    return int(weighted_sum_flops + global_update_flops)
+
+
+def compute_round_flops(local_training_flops, serialization_flops, aggregation_flops, evaluation_flops):
+    return int(local_training_flops + serialization_flops + aggregation_flops + evaluation_flops)
+
+
+def compute_round_flops_compression(compression_flops, decompression_flops, compression_pipeline_flops):
+    return int(compression_flops + decompression_flops + compression_pipeline_flops)
+
+
+def update_total_flops_metrics(total_flops_compression, total_flops, round_flops_compression, round_flops):
+    updated_total_flops_compression = int(total_flops_compression + round_flops_compression)
+    updated_total_flops = int(total_flops + round_flops + round_flops_compression)
+    return updated_total_flops_compression, updated_total_flops
+
+
 def compressed_tensor_bytes(tensor, compression_type):
     if tensor.ndim == 1:
         return tensor.element_size() * tensor.nelement()
@@ -439,12 +486,12 @@ def main():
         else:
             val_loaders.append(None)
 
-    total_upload_traffic = 0
-    total_download_traffic = 0
     total_compression_flops = 0
     total_decompression_flops = 0
     total_gs_flops = 0
+    total_round_flops_compression = 0
     total_flops = 0
+    num_model_params = int(sum(param.numel() for param in global_model.parameters()))
 
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
@@ -465,7 +512,6 @@ def main():
         param_keys = list(global_state_reference.keys())
 
         aggregated_delta = None
-        upload_traffic_round = 0
         compression_flops_round = 0
         decompression_flops_round = 0
         gs_flops_round = 0
@@ -518,7 +564,6 @@ def main():
                 for key in aggregated_delta.keys():
                     aggregated_delta[key] += reconstructed_state_dict[key] * weight
 
-            upload_traffic_round += client_upload_bytes
             per_client_upload_bytes.append(client_upload_bytes)
 
             metrics.update({"client_id": idx, "round": round_idx + 1})
@@ -610,42 +655,73 @@ def main():
         report["round"] = round_idx + 1
 
         model_size_bytes = tensor_dict_bytes(global_state)
-        # The global model is only transmitted to clients selected in this round.
-        download_traffic = model_size_bytes * selected_count
-        upload_traffic = upload_traffic_round
-        total_upload_traffic += upload_traffic
-        total_download_traffic += download_traffic
+        upload_traffic = compute_upload_traffic_for_round(per_client_upload_bytes)
+        download_traffic = compute_download_traffic_for_round(model_size_bytes, selected_count)
+        overall_traffic = compute_overall_traffic_for_round(upload_traffic, download_traffic)
+
         total_compression_flops += compression_flops_round
         total_decompression_flops += decompression_flops_round
         total_gs_flops += gs_flops_round
-        round_flops_compression = compression_flops_round + decompression_flops_round
-        round_flops = gs_flops_round + round_flops_compression
-        total_flops += round_flops
-        total_flops_compression = total_compression_flops + total_decompression_flops
+        legacy_compression_plus_decompression_round = compression_flops_round + decompression_flops_round
+        legacy_total_compression_plus_decompression = (
+            total_compression_flops + total_decompression_flops
+        )
+
+        train_samples_processed = int(sum(selected_sizes) * args.n_client_epoch)
+        eval_samples_processed = int(
+            sum(selected_sizes)
+            + len(test_data)
+            + sum(len(subset) for subset in client_val_data if len(subset) > 0)
+        )
+        local_training_flops_round = estimate_local_training_flops(num_model_params, train_samples_processed)
+        evaluation_flops_round = estimate_evaluation_flops(num_model_params, eval_samples_processed)
+        aggregation_flops_round = estimate_aggregation_flops(num_model_params, selected_count)
+        serialization_flops_round = 0
+
+        round_flops = compute_round_flops(
+            local_training_flops_round,
+            serialization_flops_round,
+            aggregation_flops_round,
+            evaluation_flops_round,
+        )
+        round_flops_compression = compute_round_flops_compression(
+            compression_flops_round,
+            decompression_flops_round,
+            gs_flops_round,
+        )
+        total_round_flops_compression, total_flops = update_total_flops_metrics(
+            total_round_flops_compression,
+            total_flops,
+            round_flops_compression,
+            round_flops,
+        )
+        total_flops_compression = total_round_flops_compression
+
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
+        report["overall_traffic"] = overall_traffic
         report["compression_flops"] = compression_flops_round
         report["decompression_flops"] = decompression_flops_round
         report["gs_flops"] = gs_flops_round
-        report["compression_plus_decompression_flops"] = round_flops_compression
+        report["compression_plus_decompression_flops"] = legacy_compression_plus_decompression_round
+        report["round_flops_compression"] = round_flops_compression
         report["round_flops"] = round_flops
         report["gs_plus_compression_plus_decompression_flops"] = (
-            round_flops
+            gs_flops_round + legacy_compression_plus_decompression_round
         )
         report["total_compression_flops"] = total_compression_flops
         report["total_decompression_flops"] = total_decompression_flops
         report["total_gs_flops"] = total_gs_flops
-        report["total_compression_plus_decompression_flops"] = total_flops_compression
+        report["total_compression_plus_decompression_flops"] = legacy_total_compression_plus_decompression
         report["total_flops_compression"] = total_flops_compression
         report["total_flops"] = total_flops
         report["total_gs_plus_compression_plus_decompression_flops"] = (
-            total_flops
+            total_gs_flops + legacy_total_compression_plus_decompression
         )
         report["upload_traffic_per_client"] = float(
             np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
         )
         report["active_clients"] = selected_count
-        report["overall_traffic"] = total_upload_traffic + total_download_traffic
 
         if args.wandb_enabled:
             wandb.log(report, step=round_idx + 1, commit=True)
