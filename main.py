@@ -662,6 +662,10 @@ def main():
         total_compression_flops += compression_flops_round
         total_decompression_flops += decompression_flops_round
         total_gs_flops += gs_flops_round
+        legacy_compression_plus_decompression_round = compression_flops_round + decompression_flops_round
+        legacy_total_compression_plus_decompression = (
+            total_compression_flops + total_decompression_flops
+        )
 
         train_samples_processed = int(sum(selected_sizes) * args.n_client_epoch)
         eval_samples_processed = int(
@@ -699,20 +703,20 @@ def main():
         report["compression_flops"] = compression_flops_round
         report["decompression_flops"] = decompression_flops_round
         report["gs_flops"] = gs_flops_round
-        report["compression_plus_decompression_flops"] = round_flops_compression
+        report["compression_plus_decompression_flops"] = legacy_compression_plus_decompression_round
         report["round_flops_compression"] = round_flops_compression
         report["round_flops"] = round_flops
         report["gs_plus_compression_plus_decompression_flops"] = (
-            round_flops
+            gs_flops_round + legacy_compression_plus_decompression_round
         )
         report["total_compression_flops"] = total_compression_flops
         report["total_decompression_flops"] = total_decompression_flops
         report["total_gs_flops"] = total_gs_flops
-        report["total_compression_plus_decompression_flops"] = total_flops_compression
+        report["total_compression_plus_decompression_flops"] = legacy_total_compression_plus_decompression
         report["total_flops_compression"] = total_flops_compression
         report["total_flops"] = total_flops
         report["total_gs_plus_compression_plus_decompression_flops"] = (
-            total_flops
+            total_gs_flops + legacy_total_compression_plus_decompression
         )
         report["upload_traffic_per_client"] = float(
             np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
