@@ -86,8 +86,13 @@ def compute_round_flops(local_training_flops, aggregation_flops, evaluation_flop
     return int(local_training_flops + aggregation_flops + evaluation_flops)
 
 
-def compute_round_flops_compression(compression_flops, decompression_flops, compression_pipeline_flops):
-    return int(compression_flops + decompression_flops + compression_pipeline_flops)
+def compute_round_flops_compression(
+    compression_flops,
+    decompression_flops,
+    serialization_flops,
+    compression_pipeline_flops,
+):
+    return int(compression_flops + decompression_flops + serialization_flops + compression_pipeline_flops)
 
 
 def update_total_flops_metrics(total_flops_compression, total_flops, round_flops_compression, round_flops):
@@ -737,6 +742,7 @@ def main():
         round_flops_compression = compute_round_flops_compression(
             compression_flops_round,
             decompression_flops_round,
+            serialization_flops_round,
             gs_flops_round,
         )
         total_round_flops_compression, total_flops = update_total_flops_metrics(
@@ -750,8 +756,6 @@ def main():
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
         report["overall_traffic"] = overall_traffic
-        report["compression_flops"] = compression_flops_round
-        report["decompression_flops"] = decompression_flops_round
         report["compression_flops_clients"] = client_compression_flops_round
         report["compression_flops_server"] = server_compression_flops_round
         report["decompression_flops_clients"] = client_decompression_flops_round
