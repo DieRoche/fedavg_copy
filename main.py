@@ -1,6 +1,8 @@
 import copy
+import csv
 import gc
 import math
+import os
 import random
 
 import numpy as np
@@ -80,18 +82,31 @@ def estimate_aggregation_flops(total_params, active_clients):
     return int(weighted_sum_flops + global_update_flops)
 
 
-def compute_round_flops(local_training_flops, serialization_flops, aggregation_flops, evaluation_flops):
-    return int(local_training_flops + serialization_flops + aggregation_flops + evaluation_flops)
+def compute_round_flops(local_training_flops, aggregation_flops, evaluation_flops):
+    return int(local_training_flops + aggregation_flops + evaluation_flops)
 
 
-def compute_round_flops_compression(compression_flops, decompression_flops, compression_pipeline_flops):
-    return int(compression_flops + decompression_flops + compression_pipeline_flops)
+def compute_round_flops_compression(
+    compression_flops,
+    decompression_flops,
+    serialization_flops,
+    compression_pipeline_flops,
+):
+    return int(compression_flops + decompression_flops + serialization_flops + compression_pipeline_flops)
 
 
 def update_total_flops_metrics(total_flops_compression, total_flops, round_flops_compression, round_flops):
     updated_total_flops_compression = int(total_flops_compression + round_flops_compression)
     updated_total_flops = int(total_flops + round_flops + round_flops_compression)
     return updated_total_flops_compression, updated_total_flops
+
+
+def estimate_payload_serialization_flops(payload):
+    if payload["mode"] == "csr":
+        dense_numel = int(payload.get("dense_numel", 0))
+        nnz = int(payload.get("nnz", 0))
+        return int(dense_numel + nnz)
+    return int(payload["q_tensor"].numel())
 
 
 def compressed_tensor_bytes(tensor, compression_type):
@@ -492,6 +507,28 @@ def main():
     total_round_flops_compression = 0
     total_flops = 0
     num_model_params = int(sum(param.numel() for param in global_model.parameters()))
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+    flops_log_path = os.path.join(output_dir, "round_flops_metrics.csv")
+    with open(flops_log_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(
+            [
+                "round",
+                "round_flops",
+                "local_training_flops_round",
+                "aggregation_flops_round",
+                "serialization_flops_round",
+                "server_compression_flops_round",
+                "client_compression_flops_round",
+                "server_decompression_flops_round",
+                "client_decompression_flops_round",
+                "acc_servers_highest",
+                "overall_traffic",
+                "upload_traffic",
+                "download_traffic",
+            ]
+        )
 
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
@@ -512,11 +549,36 @@ def main():
         param_keys = list(global_state_reference.keys())
 
         aggregated_delta = None
-        compression_flops_round = 0
-        decompression_flops_round = 0
+        client_compression_flops_round = 0
+        server_decompression_flops_round = 0
+        server_compression_flops_round = 0
+        client_decompression_flops_round = 0
+        upload_serialization_flops_round = 0
+        download_serialization_flops_round = 0
         gs_flops_round = 0
         per_client_upload_bytes = []
         client_sparsity_metrics = []
+
+        # Server -> client model broadcast compression/decompression estimates.
+        for tensor in global_state_reference.values():
+            payload, _ = serialize_tensor_payload(
+                tensor,
+                args.quantization_bits,
+                args.enable_sparse_masking,
+                args.dynamic_quantization,
+            )
+            server_compression_flops_round += estimate_payload_compression_flops(
+                tensor,
+                args.enable_sparse_masking,
+                args.quantization_bits,
+            )
+            client_decompression_flops_round += estimate_payload_decompression_flops(payload)
+            serialization_units = estimate_payload_serialization_flops(payload)
+            # One serialization and one deserialization per active client.
+            download_serialization_flops_round += 2 * serialization_units * selected_count
+        roundtrip_download_multiplier = selected_count
+        server_compression_flops_round *= roundtrip_download_multiplier
+        client_decompression_flops_round *= roundtrip_download_multiplier
 
         for client_order, idx in enumerate(selected):
             # Only active/selected clients receive the current server global model.
@@ -548,12 +610,13 @@ def main():
                     args.dynamic_quantization,
                 )
                 payload_dict[key] = payload
-                compression_flops_round += estimate_payload_compression_flops(
+                client_compression_flops_round += estimate_payload_compression_flops(
                     tensor,
                     args.enable_sparse_masking,
                     args.quantization_bits,
                 )
-                decompression_flops_round += estimate_payload_decompression_flops(payload)
+                server_decompression_flops_round += estimate_payload_decompression_flops(payload)
+                upload_serialization_flops_round += 2 * estimate_payload_serialization_flops(payload)
                 reconstructed_state_dict[key] = deserialize_tensor_payload(payload)
                 client_upload_bytes += payload_size
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
@@ -608,9 +671,6 @@ def main():
 
         loss, acc = evaluate(global_model, test_loader, device)
         
-        cos_mean = np.mean(cos)
-        cos_std = np.std(cos)
-
         training_loss_mean = np.mean(training_loss)
         training_loss_std = np.std(training_loss)
 
@@ -644,20 +704,21 @@ def main():
             report["delta_norm/mean"] = float(np.mean(delta_norms))
             report["delta_sparse_norm/mean"] = float(np.mean(delta_sparse_norms))
 
-        report["cos_lowest"] = cos_mean - cos_std
-        report["cos_highest"] = cos_mean + cos_std
         report["training_loss_lowest"] = training_loss_mean - training_loss_std
         report["training_loss_highest"] = training_loss_mean + training_loss_std
         report["acc_clients_lowest"] = acc_clients_mean - acc_clients_std
         report["acc_clients_highest"] = acc_clients_mean + acc_clients_std
         report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
-        report["round"] = round_idx + 1
 
         model_size_bytes = tensor_dict_bytes(global_state)
         upload_traffic = compute_upload_traffic_for_round(per_client_upload_bytes)
         download_traffic = compute_download_traffic_for_round(model_size_bytes, selected_count)
         overall_traffic = compute_overall_traffic_for_round(upload_traffic, download_traffic)
+
+        compression_flops_round = client_compression_flops_round + server_compression_flops_round
+        decompression_flops_round = server_decompression_flops_round + client_decompression_flops_round
+        serialization_flops_round = upload_serialization_flops_round + download_serialization_flops_round
 
         total_compression_flops += compression_flops_round
         total_decompression_flops += decompression_flops_round
@@ -672,17 +733,16 @@ def main():
         local_training_flops_round = estimate_local_training_flops(num_model_params, train_samples_processed)
         evaluation_flops_round = estimate_evaluation_flops(num_model_params, eval_samples_processed)
         aggregation_flops_round = estimate_aggregation_flops(num_model_params, selected_count)
-        serialization_flops_round = 0
 
         round_flops = compute_round_flops(
             local_training_flops_round,
-            serialization_flops_round,
             aggregation_flops_round,
             evaluation_flops_round,
         )
         round_flops_compression = compute_round_flops_compression(
             compression_flops_round,
             decompression_flops_round,
+            serialization_flops_round,
             gs_flops_round,
         )
         total_round_flops_compression, total_flops = update_total_flops_metrics(
@@ -696,9 +756,11 @@ def main():
         report["upload_traffic"] = upload_traffic
         report["download_traffic"] = download_traffic
         report["overall_traffic"] = overall_traffic
-        report["compression_flops"] = compression_flops_round
-        report["decompression_flops"] = decompression_flops_round
-        report["gs_flops"] = gs_flops_round
+        report["compression_flops_clients"] = client_compression_flops_round
+        report["compression_flops_server"] = server_compression_flops_round
+        report["decompression_flops_clients"] = client_decompression_flops_round
+        report["decompression_flops_server"] = server_decompression_flops_round
+        report["serialization_flops"] = serialization_flops_round
         report["round_flops_compression"] = round_flops_compression
         report["round_flops"] = round_flops
         report["total_compression_flops"] = total_compression_flops
@@ -713,6 +775,26 @@ def main():
 
         if args.wandb_enabled:
             wandb.log(report, step=round_idx + 1, commit=True)
+
+        with open(flops_log_path, "a", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(
+                [
+                    round_idx + 1,
+                    int(round_flops),
+                    int(local_training_flops_round),
+                    int(aggregation_flops_round),
+                    int(serialization_flops_round),
+                    int(server_compression_flops_round),
+                    int(client_compression_flops_round),
+                    int(server_decompression_flops_round),
+                    int(client_decompression_flops_round),
+                    float(report["acc_servers_highest"]),
+                    int(overall_traffic),
+                    int(upload_traffic),
+                    int(download_traffic),
+                ]
+            )
 
         print(f"Round {round_idx + 1}, Clients Acc: {acc_clients}, Server Acc: {acc_servers}")
         cleanup_memory()
