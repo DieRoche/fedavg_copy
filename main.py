@@ -106,10 +106,24 @@ def estimate_payload_serialization_flops(payload):
         dense_numel = int(payload.get("dense_numel", 0))
         nnz = int(payload.get("nnz", 0))
         return int(dense_numel + nnz)
+    if payload["mode"] == "bitmask_values":
+        numel = int(payload.get("numel", 0))
+        nnz = int(payload.get("nnz", 0))
+        return int(numel + nnz)
     return int(payload["q_tensor"].numel())
 
 
 def compressed_tensor_bytes(tensor, compression_type):
+    if compression_type == "bitmask_values":
+        dense_tensor = tensor.detach().cpu()
+        nnz = int(torch.count_nonzero(dense_tensor).item())
+        return bitmask_payload_bytes(
+            dense_tensor.numel(),
+            nnz,
+            bits=None,
+            element_size=dense_tensor.element_size(),
+        )
+
     if tensor.ndim == 1:
         return tensor.element_size() * tensor.nelement()
 
@@ -183,11 +197,33 @@ def quantize_state_dict(state_dict, bits):
     return {k: quantize_tensor(v, bits) for k, v in state_dict.items()}
 
 
-def serialize_tensor_payload(tensor, bits, enable_sparse_masking, dynamic_quantization=False):
+def bitmask_value_bytes(nnz, bits, element_size=4):
+    if bits is None:
+        return int(nnz) * int(element_size)
+    if bits == 16:
+        return int(nnz) * 2
+    if bits == 8:
+        return int(nnz) + 4
+    raise ValueError(f"Unsupported quantization bits: {bits}")
+
+
+def bitmask_payload_bytes(numel, nnz, bits, element_size=4):
+    mask_bytes = math.ceil(int(numel) / 8)
+    value_bytes = bitmask_value_bytes(nnz, bits, element_size=element_size)
+    return int(mask_bytes + value_bytes)
+
+
+def serialize_tensor_payload(
+    tensor,
+    bits,
+    enable_sparse_masking,
+    dynamic_quantization=False,
+    sparsity_compression="CSR",
+):
     cpu_tensor = tensor.detach().cpu()
     transport_dtype = str(cpu_tensor.dtype)
 
-    use_csr = enable_sparse_masking and cpu_tensor.ndim in (2, 4)
+    use_csr = enable_sparse_masking and sparsity_compression == "CSR" and cpu_tensor.ndim in (2, 4)
     if use_csr:
         csr_shape = tuple(cpu_tensor.shape)
         dense_2d = cpu_tensor if cpu_tensor.ndim == 2 else cpu_tensor.reshape(cpu_tensor.size(0), -1)
@@ -211,6 +247,31 @@ def serialize_tensor_payload(tensor, bits, enable_sparse_masking, dynamic_quanti
             "nnz": int(csr.values.size),
             "dense_numel": int(dense_numel),
         }, len(packet)
+
+    if enable_sparse_masking and sparsity_compression == "bitmask_values":
+        flat = cpu_tensor.reshape(-1)
+        mask = flat != 0
+        selected_values = flat[mask]
+        q_values, scale = quantize_tensor_for_transport(selected_values, bits)
+        packed_mask = np.packbits(mask.numpy().astype(np.uint8))
+        nnz = int(mask.sum().item())
+        payload = {
+            "mode": "bitmask_values",
+            "packed_mask": packed_mask,
+            "q_values": q_values.cpu(),
+            "scale": scale,
+            "bits": bits,
+            "transport_dtype": transport_dtype,
+            "orig_shape": tuple(cpu_tensor.shape),
+            "numel": int(flat.numel()),
+            "nnz": nnz,
+        }
+        payload_size = len(packed_mask) + bitmask_value_bytes(
+            nnz,
+            bits,
+            element_size=selected_values.element_size(),
+        )
+        return payload, payload_size
 
     q_tensor, scale = quantize_tensor_for_transport(cpu_tensor, bits)
     payload = {
@@ -259,6 +320,16 @@ def deserialize_tensor_payload(payload):
         tensor = torch.from_numpy(dense).reshape(payload["orig_shape"])
         return tensor.to(dtype=target_dtype)
 
+    if payload["mode"] == "bitmask_values":
+        mask_np = np.unpackbits(payload["packed_mask"])[: payload["numel"]].astype(bool)
+        assert int(mask_np.sum()) == int(payload["nnz"]), "Bitmask nnz mismatch"
+        q_values = torch.as_tensor(payload["q_values"])
+        values = dequantize_tensor_from_transport(q_values, payload["scale"], bits, target_dtype)
+        assert int(values.numel()) == int(payload["nnz"]), "Bitmask values length mismatch"
+        flat = torch.zeros(int(payload["numel"]), dtype=target_dtype)
+        flat[torch.from_numpy(mask_np)] = values
+        return flat.reshape(payload["orig_shape"])
+
     if payload["mode"] == "dense":
         q_tensor = payload["q_tensor"]
         tensor = dequantize_tensor_from_transport(q_tensor, payload["scale"], bits, target_dtype)
@@ -289,8 +360,13 @@ def estimate_dequantization_flops(numel, bits):
     raise ValueError(f"Unsupported quantization bits: {bits}")
 
 
-def estimate_payload_compression_flops(tensor, enable_sparse_masking, bits):
-    if not (enable_sparse_masking and tensor.ndim in (2, 4)):
+def estimate_payload_compression_flops(tensor, enable_sparse_masking, bits, sparsity_compression="CSR"):
+    if enable_sparse_masking and sparsity_compression == "bitmask_values":
+        numel = int(tensor.numel())
+        nnz = int(torch.count_nonzero(tensor).item())
+        return int(numel + nnz + estimate_quantization_flops(nnz, bits))
+
+    if not (enable_sparse_masking and sparsity_compression == "CSR" and tensor.ndim in (2, 4)):
         return estimate_quantization_flops(tensor.numel(), bits)
     dense_2d = tensor if tensor.ndim == 2 else tensor.reshape(tensor.size(0), -1)
     dense_numel = dense_2d.numel()
@@ -301,12 +377,16 @@ def estimate_payload_compression_flops(tensor, enable_sparse_masking, bits):
 
 
 def estimate_payload_decompression_flops(payload):
+    bits = payload.get("bits", None)
+    if payload["mode"] == "bitmask_values":
+        numel = int(payload.get("numel", 0))
+        nnz = int(payload.get("nnz", 0))
+        return int((2 * numel) + nnz + estimate_dequantization_flops(nnz, bits))
+
     if payload["mode"] != "csr":
-        bits = payload.get("bits", None)
         return estimate_dequantization_flops(payload["q_tensor"].numel(), bits)
     dense_numel = int(payload.get("dense_numel", 0))
     nnz = int(payload.get("nnz", 0))
-    bits = payload.get("bits", None)
     if bits is None:
         packet = payload.get("packet", b"")
         if len(packet) >= 13:
@@ -334,10 +414,21 @@ def quantized_tensor_bytes(tensor, bits):
 
 
 def compressed_quantized_tensor_bytes(tensor, compression_type, bits, dynamic_quantization=False):
+    dense_tensor = tensor.detach().cpu()
+
+    if compression_type == "bitmask_values":
+        numel = int(dense_tensor.numel())
+        nnz = int(torch.count_nonzero(dense_tensor).item())
+        return bitmask_payload_bytes(
+            numel,
+            nnz,
+            bits,
+            element_size=dense_tensor.element_size(),
+        )
+
     if tensor.ndim == 1:
         return quantized_tensor_bytes(tensor, bits)
 
-    dense_tensor = tensor.detach().cpu()
     if tensor.ndim == 2:
         dense = dense_tensor.numpy()
     elif tensor.ndim == 4:
@@ -470,7 +561,11 @@ def main():
     else:
         compression_prefix = "fedavg"
 
-    run_name_parts = [compression_prefix, args.dataset, args.model]
+    compression_method_label = {
+        "CSR": "CSR",
+        "bitmask_values": "BITMSK",
+    }.get(args.sparsity_compression, str(args.sparsity_compression))
+    run_name_parts = [compression_prefix, args.dataset, args.model, compression_method_label]
     if sparse_masking_enabled and sparsity_rate is not None and sparsity_rate > 0.0:
         sparsity_pct = sparsity_rate * 100.0 if sparsity_rate <= 1.0 else sparsity_rate
         sparsity_label = f"{sparsity_pct:g}"
@@ -558,19 +653,28 @@ def main():
         gs_flops_round = 0
         per_client_upload_bytes = []
         client_sparsity_metrics = []
+        bitmask_mask_bytes_round = 0
+        bitmask_value_bytes_round = 0
+        bitmask_total_bytes_round = 0
+        bitmask_nnz_round = 0
+        bitmask_numel_round = 0
 
-        # Server -> client model broadcast compression/decompression estimates.
+        # Server -> client model broadcasts stay dense/uncompressed; only client uploads
+        # use sparsity compression. This keeps download_traffic as dense model bytes per
+        # active client and avoids applying upload-only bitmask/CSR modes to downloads.
         for tensor in global_state_reference.values():
             payload, _ = serialize_tensor_payload(
                 tensor,
-                args.quantization_bits,
-                args.enable_sparse_masking,
-                args.dynamic_quantization,
+                bits=None,
+                enable_sparse_masking=False,
+                dynamic_quantization=False,
+                sparsity_compression="CSR",
             )
             server_compression_flops_round += estimate_payload_compression_flops(
                 tensor,
-                args.enable_sparse_masking,
-                args.quantization_bits,
+                enable_sparse_masking=False,
+                bits=None,
+                sparsity_compression="CSR",
             )
             client_decompression_flops_round += estimate_payload_decompression_flops(payload)
             serialization_units = estimate_payload_serialization_flops(payload)
@@ -608,17 +712,26 @@ def main():
                     args.quantization_bits,
                     args.enable_sparse_masking,
                     args.dynamic_quantization,
+                    args.sparsity_compression,
                 )
                 payload_dict[key] = payload
                 client_compression_flops_round += estimate_payload_compression_flops(
                     tensor,
                     args.enable_sparse_masking,
                     args.quantization_bits,
+                    args.sparsity_compression,
                 )
                 server_decompression_flops_round += estimate_payload_decompression_flops(payload)
                 upload_serialization_flops_round += 2 * estimate_payload_serialization_flops(payload)
                 reconstructed_state_dict[key] = deserialize_tensor_payload(payload)
                 client_upload_bytes += payload_size
+                if payload["mode"] == "bitmask_values":
+                    mask_bytes = len(payload["packed_mask"])
+                    bitmask_mask_bytes_round += mask_bytes
+                    bitmask_value_bytes_round += payload_size - mask_bytes
+                    bitmask_total_bytes_round += payload_size
+                    bitmask_nnz_round += int(payload["nnz"])
+                    bitmask_numel_round += int(payload["numel"])
             weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
 
             if aggregated_delta is None:
@@ -772,6 +885,12 @@ def main():
             np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
         )
         report["active_clients"] = selected_count
+        if args.sparsity_compression == "bitmask_values":
+            report["bitmask_values/mask_bytes"] = int(bitmask_mask_bytes_round)
+            report["bitmask_values/value_bytes"] = int(bitmask_value_bytes_round)
+            report["bitmask_values/total_bytes"] = int(bitmask_total_bytes_round)
+            report["bitmask_values/nnz"] = int(bitmask_nnz_round)
+            report["bitmask_values/numel"] = int(bitmask_numel_round)
 
         if args.wandb_enabled:
             wandb.log(report, step=round_idx + 1, commit=True)
