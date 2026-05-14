@@ -659,20 +659,22 @@ def main():
         bitmask_nnz_round = 0
         bitmask_numel_round = 0
 
-        # Server -> client model broadcast compression/decompression estimates.
+        # Server -> client model broadcasts stay dense/uncompressed; only client uploads
+        # use sparsity compression. This keeps download_traffic as dense model bytes per
+        # active client and avoids applying upload-only bitmask/CSR modes to downloads.
         for tensor in global_state_reference.values():
             payload, _ = serialize_tensor_payload(
                 tensor,
-                args.quantization_bits,
-                args.enable_sparse_masking,
-                args.dynamic_quantization,
-                args.sparsity_compression,
+                bits=None,
+                enable_sparse_masking=False,
+                dynamic_quantization=False,
+                sparsity_compression="CSR",
             )
             server_compression_flops_round += estimate_payload_compression_flops(
                 tensor,
-                args.enable_sparse_masking,
-                args.quantization_bits,
-                args.sparsity_compression,
+                enable_sparse_masking=False,
+                bits=None,
+                sparsity_compression="CSR",
             )
             client_decompression_flops_round += estimate_payload_decompression_flops(payload)
             serialization_units = estimate_payload_serialization_flops(payload)
