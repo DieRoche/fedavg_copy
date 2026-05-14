@@ -31,7 +31,7 @@ def get_config():
     parser = argparse.ArgumentParser(
         description="Federated Averaging Experiments")
     parser.add_argument("--method", type=str, default="fedavg")
-    parser.add_argument("--n_client", type=int, default=10)
+    parser.add_argument("--n_client", type=int, default=100)
     parser.add_argument("--client_fraction", type=float, default=1.0)
     parser.add_argument("--dirichlet", type=float, default=0.5)
     parser.add_argument("--n_epoch", type=int, default=100)
