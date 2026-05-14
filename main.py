@@ -549,29 +549,52 @@ def apply_sparse_mask(delta_dict, param_keys, args):
     return delta_sparse, metrics
 
 
-def main():
-    args = get_config()
+def is_sparse_upload_enabled(args):
+    return bool(getattr(args, "enable_sparse_masking", False))
 
+
+def has_active_sparse_mask(args):
+    sparsity_rate = getattr(args, "sparsity_rate", None)
+    return is_sparse_upload_enabled(args) and sparsity_rate is not None and sparsity_rate > 0.0
+
+
+def build_wandb_run_name(args):
     selected_clients = int(args.n_client * args.client_fraction)
     quantization_bits = getattr(args, "quantization_bits", None)
-    sparse_masking_enabled = getattr(args, "enable_sparse_masking", False)
-    sparsity_rate = getattr(args, "sparsity_rate", None)
-    if sparse_masking_enabled and sparsity_rate is not None and sparsity_rate > 0.0:
+
+    if has_active_sparse_mask(args):
         compression_prefix = f"GS{quantization_bits}" if quantization_bits is not None else "GS"
     else:
         compression_prefix = "fedavg"
 
-    compression_method_label = {
-        "CSR": "CSR",
-        "bitmask_values": "BITMSK",
-    }.get(args.sparsity_compression, str(args.sparsity_compression))
-    run_name_parts = [compression_prefix, args.dataset, args.model, compression_method_label]
-    if sparse_masking_enabled and sparsity_rate is not None and sparsity_rate > 0.0:
+    run_name_parts = [compression_prefix, args.dataset, args.model]
+
+    # The sparse serialization method is only active when sparse uploads are
+    # enabled. Otherwise, the default ``sparsity_compression=CSR`` is only an
+    # inactive configuration value and should not appear in a dense FedAvg run
+    # name.
+    if is_sparse_upload_enabled(args):
+        compression_method_label = {
+            "CSR": "CSR",
+            "bitmask_values": "BITMSK",
+        }.get(args.sparsity_compression, str(args.sparsity_compression))
+        run_name_parts.append(compression_method_label)
+
+    if has_active_sparse_mask(args):
+        sparsity_rate = getattr(args, "sparsity_rate", None)
         sparsity_pct = sparsity_rate * 100.0 if sparsity_rate <= 1.0 else sparsity_rate
         sparsity_label = f"{sparsity_pct:g}"
         run_name_parts.append(sparsity_label)
+
     run_name_parts.append(f"{selected_clients}cl")
-    run_name = "_".join(run_name_parts)
+    return "_".join(run_name_parts)
+
+
+def main():
+    args = get_config()
+
+    selected_clients = int(args.n_client * args.client_fraction)
+    run_name = build_wandb_run_name(args)
 
     if args.wandb_enabled:
         wandb.init(
