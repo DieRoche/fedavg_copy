@@ -416,6 +416,9 @@ def quantized_tensor_bytes(tensor, bits):
 def compressed_quantized_tensor_bytes(tensor, compression_type, bits, dynamic_quantization=False):
     dense_tensor = tensor.detach().cpu()
 
+    if compression_type == "dense":
+        return quantized_tensor_bytes(dense_tensor, bits)
+
     if compression_type == "bitmask_values":
         numel = int(dense_tensor.numel())
         nnz = int(torch.count_nonzero(dense_tensor).item())
@@ -577,6 +580,7 @@ def build_wandb_run_name(args):
         compression_method_label = {
             "CSR": "CSR",
             "bitmask_values": "BITMSK",
+            "dense": "DENSE",
         }.get(args.sparsity_compression, str(args.sparsity_compression))
         run_name_parts.append(compression_method_label)
 

@@ -56,7 +56,7 @@ def get_config():
         "--sparsity_compression",
         type=str,
         default="CSR",
-        choices=["CSR", "bitmask_values"],
+        choices=["CSR", "bitmask_values", "dense"],
     )
     parser.add_argument(
         "--quantization_bits",
