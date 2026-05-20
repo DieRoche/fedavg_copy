@@ -56,7 +56,7 @@ def get_config():
         "--sparsity_compression",
         type=str,
         default="CSR",
-        choices=["CSR", "bitmask_values"],
+        choices=["CSR", "bitmask_values", "dense"],
     )
     parser.add_argument(
         "--quantization_bits",
@@ -74,6 +74,7 @@ def get_config():
         ),
     )
     parser.add_argument("--wandb_enabled", type=str2bool, default=True)
+    parser.add_argument("--wandb_project", type=str, default="Gauss-Southwell")
 
     parser.add_argument("--device", type=str, default="cuda")
 

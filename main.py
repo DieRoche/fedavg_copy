@@ -207,6 +207,12 @@ def bitmask_value_bytes(nnz, bits, element_size=4):
     raise ValueError(f"Unsupported quantization bits: {bits}")
 
 
+def nnz_value_bytes_from_tensor(tensor, bits):
+    dense_tensor = tensor.detach().cpu()
+    nnz = int(torch.count_nonzero(dense_tensor).item())
+    return bitmask_value_bytes(nnz, bits, element_size=dense_tensor.element_size())
+
+
 def bitmask_payload_bytes(numel, nnz, bits, element_size=4):
     mask_bytes = math.ceil(int(numel) / 8)
     value_bytes = bitmask_value_bytes(nnz, bits, element_size=element_size)
@@ -416,6 +422,9 @@ def quantized_tensor_bytes(tensor, bits):
 def compressed_quantized_tensor_bytes(tensor, compression_type, bits, dynamic_quantization=False):
     dense_tensor = tensor.detach().cpu()
 
+    if compression_type == "dense":
+        return quantized_tensor_bytes(dense_tensor, bits)
+
     if compression_type == "bitmask_values":
         numel = int(dense_tensor.numel())
         nnz = int(torch.count_nonzero(dense_tensor).item())
@@ -577,6 +586,7 @@ def build_wandb_run_name(args):
         compression_method_label = {
             "CSR": "CSR",
             "bitmask_values": "BITMSK",
+            "dense": "DENSE",
         }.get(args.sparsity_compression, str(args.sparsity_compression))
         run_name_parts.append(compression_method_label)
 
@@ -598,7 +608,7 @@ def main():
 
     if args.wandb_enabled:
         wandb.init(
-            project="Gauss-Southwell",
+            project=args.wandb_project,
             name=run_name,
             config={k: v for k, v in vars(args).items()},
         )
@@ -681,6 +691,7 @@ def main():
         bitmask_total_bytes_round = 0
         bitmask_nnz_round = 0
         bitmask_numel_round = 0
+        nnz_upload_traffic = 0
 
         # Server -> client model broadcasts stay dense/uncompressed; only client uploads
         # use sparsity compression. This keeps download_traffic as dense model bytes per
@@ -748,6 +759,7 @@ def main():
                 upload_serialization_flops_round += 2 * estimate_payload_serialization_flops(payload)
                 reconstructed_state_dict[key] = deserialize_tensor_payload(payload)
                 client_upload_bytes += payload_size
+                nnz_upload_traffic += nnz_value_bytes_from_tensor(tensor, args.quantization_bits)
                 if payload["mode"] == "bitmask_values":
                     mask_bytes = len(payload["packed_mask"])
                     bitmask_mask_bytes_round += mask_bytes
@@ -890,6 +902,7 @@ def main():
         total_flops_compression = total_round_flops_compression
 
         report["upload_traffic"] = upload_traffic
+        report["nnz_upload_traffic"] = int(nnz_upload_traffic)
         report["download_traffic"] = download_traffic
         report["overall_traffic"] = overall_traffic
         report["compression_flops_clients"] = client_compression_flops_round
