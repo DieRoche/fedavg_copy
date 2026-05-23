@@ -75,6 +75,16 @@ def get_config():
     )
     parser.add_argument("--wandb_enabled", type=str2bool, default=True)
     parser.add_argument("--wandb_project", type=str, default="Gauss-Southwell")
+    parser.add_argument(
+        "--flops_count_method",
+        type=str,
+        default="proxy",
+        choices=["proxy", "profiler"],
+        help=(
+            "FLOPs counting method: proxy uses analytical estimates; profiler uses "
+            "torch.profiler measured FLOPs during executed train/eval kernels."
+        ),
+    )
 
     parser.add_argument("--device", type=str, default="cuda")
 
