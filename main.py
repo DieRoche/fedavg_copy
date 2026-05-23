@@ -101,6 +101,13 @@ def update_total_flops_metrics(total_flops_compression, total_flops, round_flops
     return updated_total_flops_compression, updated_total_flops
 
 
+def _sum_profiler_flops(prof):
+    total = 0
+    for evt in prof.key_averages():
+        total += int(getattr(evt, "flops", 0) or 0)
+    return int(total)
+
+
 def estimate_payload_serialization_flops(payload):
     if payload["mode"] == "csr":
         dense_numel = int(payload.get("dense_numel", 0))
@@ -684,6 +691,8 @@ def main():
         upload_serialization_flops_round = 0
         download_serialization_flops_round = 0
         gs_flops_round = 0
+        local_training_flops_measured_round = 0
+        evaluation_flops_measured_round = 0
         per_client_upload_bytes = []
         client_sparsity_metrics = []
         bitmask_mask_bytes_round = 0
@@ -722,13 +731,45 @@ def main():
             # Only active/selected clients receive the current server global model.
             local_model = copy.deepcopy(global_model)
             loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=True)
-            state_dict = client_update(local_model, loader, args.n_client_epoch, device, args.lr)
+            if args.flops_count_method == "profiler":
+                optimizer = torch.optim.SGD(local_model.parameters(), lr=args.lr)
+                local_model.train()
+                with torch.profiler.profile(with_flops=True) as prof:
+                    for _ in range(args.n_client_epoch):
+                        for data, target in loader:
+                            data, target = data.to(device), target.to(device)
+                            optimizer.zero_grad()
+                            output = local_model(data)
+                            loss = F.cross_entropy(output, target)
+                            loss.backward()
+                            optimizer.step()
+                local_training_flops_measured_round += _sum_profiler_flops(prof)
+                state_dict = local_model.state_dict()
+            else:
+                state_dict = client_update(local_model, loader, args.n_client_epoch, device, args.lr)
 
             local_params = dict_to_tensor(state_dict)
             cos.append(F.cosine_similarity(local_params, global_params, dim=0).item())
 
             train_loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=False)
-            train_loss, _ = evaluate(local_model, train_loader, device)
+            if args.flops_count_method == "profiler":
+                local_model.eval()
+                loss_accum = 0.0
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    with torch.profiler.profile(with_flops=True) as prof_eval_train:
+                        for data, target in train_loader:
+                            data, target = data.to(device), target.to(device)
+                            output = local_model(data)
+                            loss_accum += F.cross_entropy(output, target, reduction="sum").item()
+                            pred = output.argmax(dim=1)
+                            correct += (pred == target).sum().item()
+                            total += target.size(0)
+                evaluation_flops_measured_round += _sum_profiler_flops(prof_eval_train)
+                train_loss = loss_accum / total if total > 0 else 0.0
+            else:
+                train_loss, _ = evaluate(local_model, train_loader, device)
             training_loss.append(train_loss)
 
             delta_dict = {k: state_dict[k] - global_state_device[k] for k in param_keys}
@@ -817,7 +858,25 @@ def main():
 
         global_model.load_state_dict(global_state)
 
-        loss, acc = evaluate(global_model, test_loader, device)
+        if args.flops_count_method == "profiler":
+            global_model.eval()
+            loss_sum = 0.0
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                with torch.profiler.profile(with_flops=True) as prof_eval_global:
+                    for data, target in test_loader:
+                        data, target = data.to(device), target.to(device)
+                        output = global_model(data)
+                        loss_sum += F.cross_entropy(output, target, reduction="sum").item()
+                        pred = output.argmax(dim=1)
+                        correct += (pred == target).sum().item()
+                        total += target.size(0)
+            evaluation_flops_measured_round += _sum_profiler_flops(prof_eval_global)
+            loss = loss_sum / total if total > 0 else 0.0
+            acc = correct / total if total > 0 else 0.0
+        else:
+            loss, acc = evaluate(global_model, test_loader, device)
         
         training_loss_mean = np.mean(training_loss)
         training_loss_std = np.std(training_loss)
@@ -830,7 +889,23 @@ def main():
 
             if val_loaders[idx] is None:
                 val_loaders[idx] = DataLoader(subset, batch_size=args.batch_size, shuffle=False)
-            _, a = evaluate(global_model, val_loaders[idx], device)
+            if args.flops_count_method == "profiler":
+                loss_sum = 0.0
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    with torch.profiler.profile(with_flops=True) as prof_eval_val:
+                        for data, target in val_loaders[idx]:
+                            data, target = data.to(device), target.to(device)
+                            output = global_model(data)
+                            loss_sum += F.cross_entropy(output, target, reduction="sum").item()
+                            pred = output.argmax(dim=1)
+                            correct += (pred == target).sum().item()
+                            total += target.size(0)
+                evaluation_flops_measured_round += _sum_profiler_flops(prof_eval_val)
+                a = (correct / total) if total > 0 else 0.0
+            else:
+                _, a = evaluate(global_model, val_loaders[idx], device)
             acc_clients.append(a)
 
         acc_clients_mean = np.mean(acc_clients) if acc_clients else 0.0
@@ -881,6 +956,9 @@ def main():
         local_training_flops_round = estimate_local_training_flops(num_model_params, train_samples_processed)
         evaluation_flops_round = estimate_evaluation_flops(num_model_params, eval_samples_processed)
         aggregation_flops_round = estimate_aggregation_flops(num_model_params, selected_count)
+        if args.flops_count_method == "profiler":
+            local_training_flops_round = int(local_training_flops_measured_round)
+            evaluation_flops_round = int(evaluation_flops_measured_round)
 
         round_flops = compute_round_flops(
             local_training_flops_round,
@@ -912,6 +990,7 @@ def main():
         report["serialization_flops"] = serialization_flops_round
         report["round_flops_compression"] = round_flops_compression
         report["round_flops"] = round_flops
+        report["flops_count_method"] = args.flops_count_method
         report["total_compression_flops"] = total_compression_flops
         report["total_decompression_flops"] = total_decompression_flops
         report["total_gs_flops"] = total_gs_flops

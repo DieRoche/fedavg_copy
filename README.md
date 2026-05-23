@@ -250,8 +250,24 @@ Implemented accounting:
 
 Round/global FLOPs variables:
 
-- `round_flops = gs_flops_round + compression_flops_round + decompression_flops_round`
-- `total_flops += round_flops`
+- `round_flops = local_training_flops_round + aggregation_flops_round + evaluation_flops_round`
+- `round_flops_compression = compression_flops_round + decompression_flops_round + serialization_flops_round + gs_flops_round`
+- `total_flops += round_flops + round_flops_compression`
+
+**Why `round_flops` can look constant when `client_fraction=1.0`:**
+- All clients are selected every round, so `selected_sizes` is always the full client set and `sum(selected_sizes)` is constant.
+- `train_samples_processed = sum(selected_sizes) * n_client_epoch` then stays constant.
+- `aggregation_flops_round` depends on `selected_count`, which is also constant at full participation.
+- `eval_samples_processed` uses full train + test + client validation sizes, which are fixed for the run.
+- With those three inputs fixed, `round_flops` is expected to be nearly/fully constant across rounds unless you change participation, dataset cardinalities, or epoch settings.
+
+**If FLOPs were based on gradient magnitude instead:**
+- You would count only parameters/operations that are “active” under a magnitude rule (for example `|grad| > tau`), rather than assuming dense per-sample compute.
+- Then per-round FLOPs would become data/optimization-state dependent (early rounds often higher activity, later rounds often lower activity, with occasional spikes).
+- A simple proxy would replace dense parameter counts with an active count, e.g. `active_ratio_round = active_params / total_params`, then:
+  - `local_training_flops_round ≈ dense_local_flops_round * active_ratio_round`
+  - `aggregation_flops_round ≈ dense_aggregation_flops_round * active_ratio_round`
+- Under `client_fraction=1.0`, FLOPs would no longer be flat by default; they would vary as gradient distributions change over training.
 
 ### Inclusion audit for `round_flops` and `total_flops`
 
@@ -391,4 +407,3 @@ Expected method structure implied by “FedAvg” name/repo organization vs impl
 | 13. `acc_servers_highest` semantic correctness | **FAIL (name mismatch)** |
 | 14. Standard config assumptions validated | **PARTIAL** |
 | 15. Intended-vs-actual method faithfulness section provided | **PASS** |
-
