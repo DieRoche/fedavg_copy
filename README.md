@@ -254,33 +254,42 @@ Round/global FLOPs variables:
 - `round_flops_compression = compression_flops_round + decompression_flops_round + serialization_flops_round + gs_flops_round`
 - `total_flops += round_flops + round_flops_compression`
 
-**Why `round_flops` can look constant when `client_fraction=1.0`:**
-- All clients are selected every round, so `selected_sizes` is always the full client set and `sum(selected_sizes)` is constant.
-- `train_samples_processed = sum(selected_sizes) * n_client_epoch` then stays constant.
-- `aggregation_flops_round` depends on `selected_count`, which is also constant at full participation.
-- `eval_samples_processed` uses full train + test + client validation sizes, which are fixed for the run.
-- With those three inputs fixed, `round_flops` is expected to be nearly/fully constant across rounds unless you change participation, dataset cardinalities, or epoch settings.
+In `proxy` mode:
+- `local_training_flops_round` and `evaluation_flops_round` are layer-aware estimates collected from real ResNet18 forward executions via hooks.
+- The estimates use runtime batch sizes and runtime module input/output shapes.
+- Dense local training is counted as:
+  - `training_flops = forward_flops + backward_flops + optimizer_flops`
+  - `backward_flops = 2 * forward_flops`
+  - `optimizer_flops = 2 * trainable_parameter_count * optimizer_step_count`
 
-**If FLOPs were based on gradient magnitude instead:**
-- You would count only parameters/operations that are “active” under a magnitude rule (for example `|grad| > tau`), rather than assuming dense per-sample compute.
-- Then per-round FLOPs would become data/optimization-state dependent (early rounds often higher activity, later rounds often lower activity, with occasional spikes).
-- A simple proxy would replace dense parameter counts with an active count, e.g. `active_ratio_round = active_params / total_params`, then:
-  - `local_training_flops_round ≈ dense_local_flops_round * active_ratio_round`
-  - `aggregation_flops_round ≈ dense_aggregation_flops_round * active_ratio_round`
-- Under `client_fraction=1.0`, FLOPs would no longer be flat by default; they would vary as gradient distributions change over training.
+In `profiler` mode:
+- Training and evaluation FLOPs are measured directly with `torch.profiler`.
+
+`round_flops_compression` remains separate and includes:
+- compression/decompression,
+- serialization/deserialization,
+- GS masking overhead.
+
+GS masking and upload compression do **not** change dense local-training FLOPs in this repository because masking is applied to transmitted deltas, not to the dense forward/backward local model execution.
+
+Dense ResNet18 FLOPs vary primarily with:
+- selected clients,
+- number of local samples,
+- local epochs,
+- last-batch sizes,
+- evaluation coverage (train-loss eval, global test eval, client validation eval),
+- model architecture and runtime tensor shapes.
 
 ### Inclusion audit for `round_flops` and `total_flops`
 
 | FLOPs category | Included? | Notes |
 |---|---|---|
-| Local training FLOPs | **No** | Not computed anywhere |
-| Server aggregation math FLOPs | **No** | No estimator for weighted sum/addition |
+| Local training FLOPs | **Yes** | Layer-aware hook collection in proxy mode; profiler-measured in profiler mode |
+| Server aggregation math FLOPs | **Yes** | Analytical FedAvg aggregation estimator |
 | Client compression FLOPs | **Yes (estimated)** | `estimate_payload_compression_flops` |
 | Server decompression FLOPs | **Yes (estimated)** | `estimate_payload_decompression_flops` |
 | Gauss-Southwell masking FLOPs | **Yes (estimated)** | `gs_flops` from masking path |
-| Evaluation FLOPs | **No** | Test/client-val evaluation not counted |
-
-Therefore names `round_flops` / `total_flops` suggest broader training compute than actually counted.
+| Evaluation FLOPs | **Yes** | Layer-aware hook collection in proxy mode; profiler-measured in profiler mode |
 
 ---
 
