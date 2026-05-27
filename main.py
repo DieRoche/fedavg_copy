@@ -17,9 +17,81 @@ from compression import compress_csr, decompress_csr, pack_csr, unpack_csr
 from resnet18 import ResNet18
 
 
-def client_update(model, loader, epochs, device, lr):
+def estimate_module_forward_flops(module, inputs, output):
+    if not torch.is_tensor(output):
+        return 0.0
+
+    if isinstance(module, torch.nn.Conv2d):
+        batch, out_channels, out_h, out_w = output.shape
+        kernel_h, kernel_w = module.kernel_size
+        in_channels_per_group = module.in_channels // module.groups
+        return float(
+            2
+            * batch
+            * out_channels
+            * out_h
+            * out_w
+            * in_channels_per_group
+            * kernel_h
+            * kernel_w
+        )
+    if isinstance(module, torch.nn.Linear):
+        batch = output.shape[0] if output.ndim > 1 else 1
+        return float(2 * batch * module.in_features * module.out_features)
+    if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+        return float(4 * output.numel())
+    if isinstance(module, torch.nn.ReLU):
+        return float(output.numel())
+    if isinstance(module, torch.nn.MaxPool2d):
+        kernel = module.kernel_size
+        kernel_h, kernel_w = (kernel, kernel) if isinstance(kernel, int) else kernel
+        return float(output.numel() * kernel_h * kernel_w)
+    if isinstance(module, torch.nn.AdaptiveAvgPool2d):
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return 0.0
+        input_numel = inputs[0].numel()
+        output_numel = output.numel()
+        return float(input_numel + output_numel)
+    return 0.0
+
+
+def should_register_flop_hook(module):
+    return isinstance(
+        module,
+        (
+            torch.nn.Conv2d,
+            torch.nn.Linear,
+            torch.nn.BatchNorm1d,
+            torch.nn.BatchNorm2d,
+            torch.nn.BatchNorm3d,
+            torch.nn.ReLU,
+            torch.nn.MaxPool2d,
+            torch.nn.AdaptiveAvgPool2d,
+        ),
+    )
+
+
+def register_forward_flop_hooks(model, flops_state):
+    handles = []
+
+    def _hook(module, inputs, output):
+        flops_state["forward_flops"] += estimate_module_forward_flops(module, inputs, output)
+
+    for module in model.modules():
+        if should_register_flop_hook(module):
+            handles.append(module.register_forward_hook(_hook))
+    return handles
+
+
+def client_update(model, loader, epochs, device, lr, collect_flops=False):
     model.train()
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    forward_flops = 0.0
+    optimizer_steps = 0
+    handles = []
+    flops_state = {"forward_flops": 0.0}
+    if collect_flops:
+        handles = register_forward_flop_hooks(model, flops_state)
     for _ in range(epochs):
         for data, target in loader:
             data, target = data.to(device), target.to(device)
@@ -28,14 +100,29 @@ def client_update(model, loader, epochs, device, lr):
             loss = F.cross_entropy(output, target)
             loss.backward()
             optimizer.step()
-    return model.state_dict()
+            optimizer_steps += 1
+    if collect_flops:
+        forward_flops = flops_state["forward_flops"]
+        for handle in handles:
+            handle.remove()
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        backward_flops = 2.0 * forward_flops
+        optimizer_flops = 2.0 * trainable_params * optimizer_steps
+        training_flops = forward_flops + backward_flops + optimizer_flops
+        return model.state_dict(), float(training_flops)
+    return model.state_dict(), 0.0
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, collect_flops=False):
     model.eval()
     loss = 0.0
     correct = 0
     total = 0
+    eval_forward_flops = 0.0
+    handles = []
+    flops_state = {"forward_flops": 0.0}
+    if collect_flops:
+        handles = register_forward_flop_hooks(model, flops_state)
     with torch.no_grad():
         for data, target in loader:
             data, target = data.to(device), target.to(device)
@@ -44,7 +131,11 @@ def evaluate(model, loader, device):
             pred = output.argmax(dim=1)
             correct += (pred == target).sum().item()
             total += target.size(0)
-    return loss / total, correct / total
+    if collect_flops:
+        eval_forward_flops = flops_state["forward_flops"]
+        for handle in handles:
+            handle.remove()
+    return loss / total, correct / total, float(eval_forward_flops)
 def tensor_dict_bytes(tensor_dict):
     return sum(t.element_size() * t.nelement() for t in tensor_dict.values())
 
@@ -653,7 +744,9 @@ def main():
                 "round_flops",
                 "local_training_flops_round",
                 "aggregation_flops_round",
+                "evaluation_flops_round",
                 "serialization_flops_round",
+                "round_flops_compression",
                 "server_compression_flops_round",
                 "client_compression_flops_round",
                 "server_decompression_flops_round",
@@ -746,7 +839,15 @@ def main():
                 local_training_flops_measured_round += _sum_profiler_flops(prof)
                 state_dict = local_model.state_dict()
             else:
-                state_dict = client_update(local_model, loader, args.n_client_epoch, device, args.lr)
+                state_dict, client_training_flops = client_update(
+                    local_model,
+                    loader,
+                    args.n_client_epoch,
+                    device,
+                    args.lr,
+                    collect_flops=True,
+                )
+                local_training_flops_measured_round += client_training_flops
 
             local_params = dict_to_tensor(state_dict)
             cos.append(F.cosine_similarity(local_params, global_params, dim=0).item())
@@ -769,7 +870,8 @@ def main():
                 evaluation_flops_measured_round += _sum_profiler_flops(prof_eval_train)
                 train_loss = loss_accum / total if total > 0 else 0.0
             else:
-                train_loss, _ = evaluate(local_model, train_loader, device)
+                train_loss, _, client_eval_flops = evaluate(local_model, train_loader, device, collect_flops=True)
+                evaluation_flops_measured_round += client_eval_flops
             training_loss.append(train_loss)
 
             delta_dict = {k: state_dict[k] - global_state_device[k] for k in param_keys}
@@ -876,7 +978,8 @@ def main():
             loss = loss_sum / total if total > 0 else 0.0
             acc = correct / total if total > 0 else 0.0
         else:
-            loss, acc = evaluate(global_model, test_loader, device)
+            loss, acc, global_eval_flops = evaluate(global_model, test_loader, device, collect_flops=True)
+            evaluation_flops_measured_round += global_eval_flops
         
         training_loss_mean = np.mean(training_loss)
         training_loss_std = np.std(training_loss)
@@ -905,7 +1008,8 @@ def main():
                 evaluation_flops_measured_round += _sum_profiler_flops(prof_eval_val)
                 a = (correct / total) if total > 0 else 0.0
             else:
-                _, a = evaluate(global_model, val_loaders[idx], device)
+                _, a, client_val_flops = evaluate(global_model, val_loaders[idx], device, collect_flops=True)
+                evaluation_flops_measured_round += client_val_flops
             acc_clients.append(a)
 
         acc_clients_mean = np.mean(acc_clients) if acc_clients else 0.0
@@ -947,14 +1051,8 @@ def main():
         total_decompression_flops += decompression_flops_round
         total_gs_flops += gs_flops_round
 
-        train_samples_processed = int(sum(selected_sizes) * args.n_client_epoch)
-        eval_samples_processed = int(
-            sum(selected_sizes)
-            + len(test_data)
-            + sum(len(subset) for subset in client_val_data if len(subset) > 0)
-        )
-        local_training_flops_round = estimate_local_training_flops(num_model_params, train_samples_processed)
-        evaluation_flops_round = estimate_evaluation_flops(num_model_params, eval_samples_processed)
+        local_training_flops_round = int(local_training_flops_measured_round)
+        evaluation_flops_round = int(evaluation_flops_measured_round)
         aggregation_flops_round = estimate_aggregation_flops(num_model_params, selected_count)
         if args.flops_count_method == "profiler":
             local_training_flops_round = int(local_training_flops_measured_round)
@@ -989,6 +1087,9 @@ def main():
         report["decompression_flops_server"] = server_decompression_flops_round
         report["serialization_flops"] = serialization_flops_round
         report["round_flops_compression"] = round_flops_compression
+        report["local_training_flops_round"] = int(local_training_flops_round)
+        report["aggregation_flops_round"] = int(aggregation_flops_round)
+        report["evaluation_flops_round"] = int(evaluation_flops_round)
         report["round_flops"] = round_flops
         report["flops_count_method"] = args.flops_count_method
         report["total_compression_flops"] = total_compression_flops
@@ -1018,7 +1119,9 @@ def main():
                     int(round_flops),
                     int(local_training_flops_round),
                     int(aggregation_flops_round),
+                    int(evaluation_flops_round),
                     int(serialization_flops_round),
+                    int(round_flops_compression),
                     int(server_compression_flops_round),
                     int(client_compression_flops_round),
                     int(server_decompression_flops_round),
