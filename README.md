@@ -20,7 +20,7 @@ The goal is to describe what this code really does for `METHOD_NAME = FedAvg`, n
 - If run with defaults (`--enable_sparse_masking` off, `--quantization_bits` none), behavior is close to dense FedAvg delta aggregation.
 - `--method` exists but is not used to switch algorithm logic; method activation is effectively controlled by other flags.
 - Communication is simulated in-memory; no network serialization stack is used beyond optional byte-packet creation for accounting/reconstruction.
-- FLOPs logged in `round_flops` / `total_flops` **exclude local training FLOPs and evaluation FLOPs**.
+- FLOPs logged in `round_flops` / `total_flops` include compute-only training/aggregation/evaluation FLOPs and exclude compression-pipeline FLOPs.
 
 ---
 
@@ -252,7 +252,8 @@ Round/global FLOPs variables:
 
 - `round_flops = local_training_flops_round + aggregation_flops_round + evaluation_flops_round`
 - `round_flops_compression = compression_flops_round + decompression_flops_round + serialization_flops_round + gs_flops_round`
-- `total_flops += round_flops + round_flops_compression`
+- `total_flops += round_flops`
+- `total_flops_compression += round_flops_compression`
 
 In `proxy` mode:
 - `local_training_flops_round` and `evaluation_flops_round` are layer-aware estimates collected from real ResNet18 forward executions via hooks.
@@ -263,7 +264,7 @@ In `proxy` mode:
   - `optimizer_flops = 2 * trainable_parameter_count * optimizer_step_count`
 
 In `profiler` mode:
-- Training and evaluation FLOPs are measured directly with `torch.profiler`.
+- Training and evaluation FLOPs are measured with `torch.profiler`, with residual-add FLOPs explicitly added so semantics match proxy-mode ResNet18 accounting.
 
 `round_flops_compression` remains separate and includes:
 - compression/decompression,
@@ -345,7 +346,7 @@ Implications:
 |---|---|---|
 | `sparsity`, `density` (per client) | Yes | Logged inside client loop with same step and `commit=False` |
 | `upload_traffic`, `download_traffic`, `overall_traffic` | Yes | In round `report` |
-| `round_flops`, `total_flops` | Yes | But partial FLOPs scope |
+| `round_flops`, `total_flops` | Yes | Compute-only FLOPs scope (training + aggregation + evaluation) |
 | `total_flops_compression` | Yes | Alias of compression+decompression cumulative |
 | `compression_flops`, `decompression_flops`, `gs_flops` | Yes | Round-level estimates |
 | `acc_servers_highest`, `acc_clients_highest`, etc. | Yes | Statistical forms; some naming mismatch vs semantics |
@@ -383,7 +384,7 @@ Expected method structure implied by “FedAvg” name/repo organization vs impl
 
 1. **Method flag mismatch:** `--method` does not control algorithm selection.
 2. **Traffic mismatch on download:** uses total clients, not active clients; estimated from dense model size.
-3. **FLOPs naming mismatch:** `round_flops` / `total_flops` exclude local training and evaluation, yet names imply full compute.
+3. **FLOPs scope split:** `round_flops` / `total_flops` are compute-only, while compression/serialization/GS FLOPs are tracked in dedicated compression metrics.
 4. **Accuracy naming mismatch:** `acc_servers_highest` equals current test accuracy, not best-over-time.
 5. **In-process encode/decode:** payload realism is partial; no true transport overhead.
 6. **Potential ambiguity in “FedAvg”:** core update is FedAvg-like, but optional sparsity/compression paths can materially alter behavior.

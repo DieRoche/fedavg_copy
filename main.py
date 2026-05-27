@@ -14,7 +14,7 @@ import wandb
 from config import get_config
 from data_utils import get_dataset
 from compression import compress_csr, decompress_csr, pack_csr, unpack_csr
-from resnet18 import ResNet18
+from resnet18 import BasicBlock, ResNet18
 
 
 def estimate_module_forward_flops(module, inputs, output):
@@ -46,6 +46,8 @@ def estimate_module_forward_flops(module, inputs, output):
         kernel = module.kernel_size
         kernel_h, kernel_w = (kernel, kernel) if isinstance(kernel, int) else kernel
         return float(output.numel() * kernel_h * kernel_w)
+    if isinstance(module, BasicBlock):
+        return float(output.numel())
     if isinstance(module, torch.nn.AdaptiveAvgPool2d):
         if not inputs or not torch.is_tensor(inputs[0]):
             return 0.0
@@ -67,6 +69,7 @@ def should_register_flop_hook(module):
             torch.nn.ReLU,
             torch.nn.MaxPool2d,
             torch.nn.AdaptiveAvgPool2d,
+            BasicBlock,
         ),
     )
 
@@ -83,6 +86,21 @@ def register_forward_flop_hooks(model, flops_state):
     return handles
 
 
+
+
+def register_residual_add_flop_hooks(model, flops_state):
+    handles = []
+
+    def _hook(module, _inputs, output):
+        if torch.is_tensor(output):
+            flops_state["residual_add_flops"] += float(output.numel())
+
+    for module in model.modules():
+        if isinstance(module, BasicBlock):
+            handles.append(module.register_forward_hook(_hook))
+    return handles
+
+
 def client_update(model, loader, epochs, device, lr, collect_flops=False):
     model.train()
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
@@ -92,19 +110,21 @@ def client_update(model, loader, epochs, device, lr, collect_flops=False):
     flops_state = {"forward_flops": 0.0}
     if collect_flops:
         handles = register_forward_flop_hooks(model, flops_state)
-    for _ in range(epochs):
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = F.cross_entropy(output, target)
-            loss.backward()
-            optimizer.step()
-            optimizer_steps += 1
-    if collect_flops:
-        forward_flops = flops_state["forward_flops"]
+    try:
+        for _ in range(epochs):
+            for data, target in loader:
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = F.cross_entropy(output, target)
+                loss.backward()
+                optimizer.step()
+                optimizer_steps += 1
+    finally:
         for handle in handles:
             handle.remove()
+    if collect_flops:
+        forward_flops = flops_state["forward_flops"]
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         backward_flops = 2.0 * forward_flops
         optimizer_flops = 2.0 * trainable_params * optimizer_steps
@@ -123,19 +143,22 @@ def evaluate(model, loader, device, collect_flops=False):
     flops_state = {"forward_flops": 0.0}
     if collect_flops:
         handles = register_forward_flop_hooks(model, flops_state)
-    with torch.no_grad():
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            loss += F.cross_entropy(output, target, reduction="sum").item()
-            pred = output.argmax(dim=1)
-            correct += (pred == target).sum().item()
-            total += target.size(0)
-    if collect_flops:
-        eval_forward_flops = flops_state["forward_flops"]
+    try:
+        with torch.no_grad():
+            for data, target in loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                loss += F.cross_entropy(output, target, reduction="sum").item()
+                pred = output.argmax(dim=1)
+                correct += (pred == target).sum().item()
+                total += target.size(0)
+    finally:
         for handle in handles:
             handle.remove()
+    if collect_flops:
+        eval_forward_flops = flops_state["forward_flops"]
     return loss / total, correct / total, float(eval_forward_flops)
+
 def tensor_dict_bytes(tensor_dict):
     return sum(t.element_size() * t.nelement() for t in tensor_dict.values())
 
@@ -188,7 +211,7 @@ def compute_round_flops_compression(
 
 def update_total_flops_metrics(total_flops_compression, total_flops, round_flops_compression, round_flops):
     updated_total_flops_compression = int(total_flops_compression + round_flops_compression)
-    updated_total_flops = int(total_flops + round_flops + round_flops_compression)
+    updated_total_flops = int(total_flops + round_flops)
     return updated_total_flops_compression, updated_total_flops
 
 
@@ -784,8 +807,8 @@ def main():
         upload_serialization_flops_round = 0
         download_serialization_flops_round = 0
         gs_flops_round = 0
-        local_training_flops_measured_round = 0
-        evaluation_flops_measured_round = 0
+        local_training_flops_accounted_round = 0
+        evaluation_flops_accounted_round = 0
         per_client_upload_bytes = []
         client_sparsity_metrics = []
         bitmask_mask_bytes_round = 0
@@ -827,16 +850,24 @@ def main():
             if args.flops_count_method == "profiler":
                 optimizer = torch.optim.SGD(local_model.parameters(), lr=args.lr)
                 local_model.train()
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(local_model, residual_flops_state)
                 with torch.profiler.profile(with_flops=True) as prof:
-                    for _ in range(args.n_client_epoch):
-                        for data, target in loader:
-                            data, target = data.to(device), target.to(device)
-                            optimizer.zero_grad()
-                            output = local_model(data)
-                            loss = F.cross_entropy(output, target)
-                            loss.backward()
-                            optimizer.step()
-                local_training_flops_measured_round += _sum_profiler_flops(prof)
+                    try:
+                        for _ in range(args.n_client_epoch):
+                            for data, target in loader:
+                                data, target = data.to(device), target.to(device)
+                                optimizer.zero_grad()
+                                output = local_model(data)
+                                loss = F.cross_entropy(output, target)
+                                loss.backward()
+                                optimizer.step()
+                    finally:
+                        for handle in residual_handles:
+                            handle.remove()
+                local_training_flops_accounted_round += (
+                    _sum_profiler_flops(prof) + int(residual_flops_state["residual_add_flops"])
+                )
                 state_dict = local_model.state_dict()
             else:
                 state_dict, client_training_flops = client_update(
@@ -847,7 +878,7 @@ def main():
                     args.lr,
                     collect_flops=True,
                 )
-                local_training_flops_measured_round += client_training_flops
+                local_training_flops_accounted_round += client_training_flops
 
             local_params = dict_to_tensor(state_dict)
             cos.append(F.cosine_similarity(local_params, global_params, dim=0).item())
@@ -858,20 +889,28 @@ def main():
                 loss_accum = 0.0
                 correct = 0
                 total = 0
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(local_model, residual_flops_state)
                 with torch.no_grad():
                     with torch.profiler.profile(with_flops=True) as prof_eval_train:
-                        for data, target in train_loader:
-                            data, target = data.to(device), target.to(device)
-                            output = local_model(data)
-                            loss_accum += F.cross_entropy(output, target, reduction="sum").item()
-                            pred = output.argmax(dim=1)
-                            correct += (pred == target).sum().item()
-                            total += target.size(0)
-                evaluation_flops_measured_round += _sum_profiler_flops(prof_eval_train)
+                        try:
+                            for data, target in train_loader:
+                                data, target = data.to(device), target.to(device)
+                                output = local_model(data)
+                                loss_accum += F.cross_entropy(output, target, reduction="sum").item()
+                                pred = output.argmax(dim=1)
+                                correct += (pred == target).sum().item()
+                                total += target.size(0)
+                        finally:
+                            for handle in residual_handles:
+                                handle.remove()
+                evaluation_flops_accounted_round += (
+                    _sum_profiler_flops(prof_eval_train) + int(residual_flops_state["residual_add_flops"])
+                )
                 train_loss = loss_accum / total if total > 0 else 0.0
             else:
                 train_loss, _, client_eval_flops = evaluate(local_model, train_loader, device, collect_flops=True)
-                evaluation_flops_measured_round += client_eval_flops
+                evaluation_flops_accounted_round += client_eval_flops
             training_loss.append(train_loss)
 
             delta_dict = {k: state_dict[k] - global_state_device[k] for k in param_keys}
@@ -965,21 +1004,29 @@ def main():
             loss_sum = 0.0
             correct = 0
             total = 0
+            residual_flops_state = {"residual_add_flops": 0.0}
+            residual_handles = register_residual_add_flop_hooks(global_model, residual_flops_state)
             with torch.no_grad():
                 with torch.profiler.profile(with_flops=True) as prof_eval_global:
-                    for data, target in test_loader:
-                        data, target = data.to(device), target.to(device)
-                        output = global_model(data)
-                        loss_sum += F.cross_entropy(output, target, reduction="sum").item()
-                        pred = output.argmax(dim=1)
-                        correct += (pred == target).sum().item()
-                        total += target.size(0)
-            evaluation_flops_measured_round += _sum_profiler_flops(prof_eval_global)
+                    try:
+                        for data, target in test_loader:
+                            data, target = data.to(device), target.to(device)
+                            output = global_model(data)
+                            loss_sum += F.cross_entropy(output, target, reduction="sum").item()
+                            pred = output.argmax(dim=1)
+                            correct += (pred == target).sum().item()
+                            total += target.size(0)
+                    finally:
+                        for handle in residual_handles:
+                            handle.remove()
+            evaluation_flops_accounted_round += (
+                _sum_profiler_flops(prof_eval_global) + int(residual_flops_state["residual_add_flops"])
+            )
             loss = loss_sum / total if total > 0 else 0.0
             acc = correct / total if total > 0 else 0.0
         else:
             loss, acc, global_eval_flops = evaluate(global_model, test_loader, device, collect_flops=True)
-            evaluation_flops_measured_round += global_eval_flops
+            evaluation_flops_accounted_round += global_eval_flops
         
         training_loss_mean = np.mean(training_loss)
         training_loss_std = np.std(training_loss)
@@ -996,20 +1043,28 @@ def main():
                 loss_sum = 0.0
                 correct = 0
                 total = 0
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(global_model, residual_flops_state)
                 with torch.no_grad():
                     with torch.profiler.profile(with_flops=True) as prof_eval_val:
-                        for data, target in val_loaders[idx]:
-                            data, target = data.to(device), target.to(device)
-                            output = global_model(data)
-                            loss_sum += F.cross_entropy(output, target, reduction="sum").item()
-                            pred = output.argmax(dim=1)
-                            correct += (pred == target).sum().item()
-                            total += target.size(0)
-                evaluation_flops_measured_round += _sum_profiler_flops(prof_eval_val)
+                        try:
+                            for data, target in val_loaders[idx]:
+                                data, target = data.to(device), target.to(device)
+                                output = global_model(data)
+                                loss_sum += F.cross_entropy(output, target, reduction="sum").item()
+                                pred = output.argmax(dim=1)
+                                correct += (pred == target).sum().item()
+                                total += target.size(0)
+                        finally:
+                            for handle in residual_handles:
+                                handle.remove()
+                evaluation_flops_accounted_round += (
+                    _sum_profiler_flops(prof_eval_val) + int(residual_flops_state["residual_add_flops"])
+                )
                 a = (correct / total) if total > 0 else 0.0
             else:
                 _, a, client_val_flops = evaluate(global_model, val_loaders[idx], device, collect_flops=True)
-                evaluation_flops_measured_round += client_val_flops
+                evaluation_flops_accounted_round += client_val_flops
             acc_clients.append(a)
 
         acc_clients_mean = np.mean(acc_clients) if acc_clients else 0.0
@@ -1051,12 +1106,12 @@ def main():
         total_decompression_flops += decompression_flops_round
         total_gs_flops += gs_flops_round
 
-        local_training_flops_round = int(local_training_flops_measured_round)
-        evaluation_flops_round = int(evaluation_flops_measured_round)
+        local_training_flops_round = int(local_training_flops_accounted_round)
+        evaluation_flops_round = int(evaluation_flops_accounted_round)
         aggregation_flops_round = estimate_aggregation_flops(num_model_params, selected_count)
         if args.flops_count_method == "profiler":
-            local_training_flops_round = int(local_training_flops_measured_round)
-            evaluation_flops_round = int(evaluation_flops_measured_round)
+            local_training_flops_round = int(local_training_flops_accounted_round)
+            evaluation_flops_round = int(evaluation_flops_accounted_round)
 
         round_flops = compute_round_flops(
             local_training_flops_round,
