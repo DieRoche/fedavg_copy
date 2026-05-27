@@ -264,7 +264,7 @@ In `proxy` mode:
   - `optimizer_flops = 2 * trainable_parameter_count * optimizer_step_count`
 
 In `profiler` mode:
-- Training and evaluation FLOPs are measured directly with `torch.profiler`.
+- Training and evaluation FLOPs are measured with `torch.profiler`, with residual-add FLOPs explicitly added so semantics match proxy-mode ResNet18 accounting.
 
 `round_flops_compression` remains separate and includes:
 - compression/decompression,

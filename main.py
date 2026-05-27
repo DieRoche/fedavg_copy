@@ -86,6 +86,21 @@ def register_forward_flop_hooks(model, flops_state):
     return handles
 
 
+
+
+def register_residual_add_flop_hooks(model, flops_state):
+    handles = []
+
+    def _hook(module, _inputs, output):
+        if torch.is_tensor(output):
+            flops_state["residual_add_flops"] += float(output.numel())
+
+    for module in model.modules():
+        if isinstance(module, BasicBlock):
+            handles.append(module.register_forward_hook(_hook))
+    return handles
+
+
 def client_update(model, loader, epochs, device, lr, collect_flops=False):
     model.train()
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
@@ -835,16 +850,24 @@ def main():
             if args.flops_count_method == "profiler":
                 optimizer = torch.optim.SGD(local_model.parameters(), lr=args.lr)
                 local_model.train()
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(local_model, residual_flops_state)
                 with torch.profiler.profile(with_flops=True) as prof:
-                    for _ in range(args.n_client_epoch):
-                        for data, target in loader:
-                            data, target = data.to(device), target.to(device)
-                            optimizer.zero_grad()
-                            output = local_model(data)
-                            loss = F.cross_entropy(output, target)
-                            loss.backward()
-                            optimizer.step()
-                local_training_flops_accounted_round += _sum_profiler_flops(prof)
+                    try:
+                        for _ in range(args.n_client_epoch):
+                            for data, target in loader:
+                                data, target = data.to(device), target.to(device)
+                                optimizer.zero_grad()
+                                output = local_model(data)
+                                loss = F.cross_entropy(output, target)
+                                loss.backward()
+                                optimizer.step()
+                    finally:
+                        for handle in residual_handles:
+                            handle.remove()
+                local_training_flops_accounted_round += (
+                    _sum_profiler_flops(prof) + int(residual_flops_state["residual_add_flops"])
+                )
                 state_dict = local_model.state_dict()
             else:
                 state_dict, client_training_flops = client_update(
@@ -866,16 +889,24 @@ def main():
                 loss_accum = 0.0
                 correct = 0
                 total = 0
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(local_model, residual_flops_state)
                 with torch.no_grad():
                     with torch.profiler.profile(with_flops=True) as prof_eval_train:
-                        for data, target in train_loader:
-                            data, target = data.to(device), target.to(device)
-                            output = local_model(data)
-                            loss_accum += F.cross_entropy(output, target, reduction="sum").item()
-                            pred = output.argmax(dim=1)
-                            correct += (pred == target).sum().item()
-                            total += target.size(0)
-                evaluation_flops_accounted_round += _sum_profiler_flops(prof_eval_train)
+                        try:
+                            for data, target in train_loader:
+                                data, target = data.to(device), target.to(device)
+                                output = local_model(data)
+                                loss_accum += F.cross_entropy(output, target, reduction="sum").item()
+                                pred = output.argmax(dim=1)
+                                correct += (pred == target).sum().item()
+                                total += target.size(0)
+                        finally:
+                            for handle in residual_handles:
+                                handle.remove()
+                evaluation_flops_accounted_round += (
+                    _sum_profiler_flops(prof_eval_train) + int(residual_flops_state["residual_add_flops"])
+                )
                 train_loss = loss_accum / total if total > 0 else 0.0
             else:
                 train_loss, _, client_eval_flops = evaluate(local_model, train_loader, device, collect_flops=True)
@@ -973,16 +1004,24 @@ def main():
             loss_sum = 0.0
             correct = 0
             total = 0
+            residual_flops_state = {"residual_add_flops": 0.0}
+            residual_handles = register_residual_add_flop_hooks(global_model, residual_flops_state)
             with torch.no_grad():
                 with torch.profiler.profile(with_flops=True) as prof_eval_global:
-                    for data, target in test_loader:
-                        data, target = data.to(device), target.to(device)
-                        output = global_model(data)
-                        loss_sum += F.cross_entropy(output, target, reduction="sum").item()
-                        pred = output.argmax(dim=1)
-                        correct += (pred == target).sum().item()
-                        total += target.size(0)
-            evaluation_flops_accounted_round += _sum_profiler_flops(prof_eval_global)
+                    try:
+                        for data, target in test_loader:
+                            data, target = data.to(device), target.to(device)
+                            output = global_model(data)
+                            loss_sum += F.cross_entropy(output, target, reduction="sum").item()
+                            pred = output.argmax(dim=1)
+                            correct += (pred == target).sum().item()
+                            total += target.size(0)
+                    finally:
+                        for handle in residual_handles:
+                            handle.remove()
+            evaluation_flops_accounted_round += (
+                _sum_profiler_flops(prof_eval_global) + int(residual_flops_state["residual_add_flops"])
+            )
             loss = loss_sum / total if total > 0 else 0.0
             acc = correct / total if total > 0 else 0.0
         else:
@@ -1004,16 +1043,24 @@ def main():
                 loss_sum = 0.0
                 correct = 0
                 total = 0
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(global_model, residual_flops_state)
                 with torch.no_grad():
                     with torch.profiler.profile(with_flops=True) as prof_eval_val:
-                        for data, target in val_loaders[idx]:
-                            data, target = data.to(device), target.to(device)
-                            output = global_model(data)
-                            loss_sum += F.cross_entropy(output, target, reduction="sum").item()
-                            pred = output.argmax(dim=1)
-                            correct += (pred == target).sum().item()
-                            total += target.size(0)
-                evaluation_flops_accounted_round += _sum_profiler_flops(prof_eval_val)
+                        try:
+                            for data, target in val_loaders[idx]:
+                                data, target = data.to(device), target.to(device)
+                                output = global_model(data)
+                                loss_sum += F.cross_entropy(output, target, reduction="sum").item()
+                                pred = output.argmax(dim=1)
+                                correct += (pred == target).sum().item()
+                                total += target.size(0)
+                        finally:
+                            for handle in residual_handles:
+                                handle.remove()
+                evaluation_flops_accounted_round += (
+                    _sum_profiler_flops(prof_eval_val) + int(residual_flops_state["residual_add_flops"])
+                )
                 a = (correct / total) if total > 0 else 0.0
             else:
                 _, a, client_val_flops = evaluate(global_model, val_loaders[idx], device, collect_flops=True)
