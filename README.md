@@ -296,16 +296,18 @@ Dense ResNet18 FLOPs vary primarily with:
 
 ## 13. Compression / Decompression FLOPs Validation
 
-`total_flops_compression` is set to `total_compression_flops + total_decompression_flops`.
+`total_flops_compression` is updated as:
+
+- `round_flops_compression = compression_flops_round + decompression_flops_round + serialization_flops_round + gs_flops_round`
+- `total_flops_compression += round_flops_compression`
 
 Interpretation:
 
-- Includes estimated client-side serialization/compression/quantization work.
-- Includes estimated decode/dequantization/reconstruction work.
-- Does **not** include masking FLOPs (`gs_flops`) despite related preprocessing.
-- Does **not** include server-to-client compression/decompression (none implemented).
+- Includes compression + decompression FLOPs.
+- Includes serialization/deserialization FLOPs.
+- Includes Gauss-Southwell masking FLOPs (`gs_flops`).
 
-So metric is narrower than a full bidirectional compression pipeline FLOPs metric.
+So this metric captures the full round compression pipeline FLOPs tracked in code.
 
 ---
 
@@ -347,7 +349,7 @@ Implications:
 | `sparsity`, `density` (per client) | Yes | Logged inside client loop with same step and `commit=False` |
 | `upload_traffic`, `download_traffic`, `overall_traffic` | Yes | In round `report` |
 | `round_flops`, `total_flops` | Yes | Compute-only FLOPs scope (training + aggregation + evaluation) |
-| `total_flops_compression` | Yes | Alias of compression+decompression cumulative |
+| `total_flops_compression` | Yes | Cumulative `round_flops_compression` (compression + decompression + serialization + GS masking) |
 | `compression_flops`, `decompression_flops`, `gs_flops` | Yes | Round-level estimates |
 | `acc_servers_highest`, `acc_clients_highest`, etc. | Yes | Statistical forms; some naming mismatch vs semantics |
 | `cos_*`, `training_loss_*`, delta/sparsity summaries | Yes | In `report` |
@@ -413,7 +415,7 @@ Expected method structure implied by “FedAvg” name/repo organization vs impl
 | 10. Server→client processing (compression/etc.) | **FAIL (none active)** |
 | 11. Download traffic reflects actual outbound payload | **FAIL** |
 | 11. `overall_traffic = upload + download` | **PASS (cumulative)** |
-| 12. `total_flops_compression` completeness | **PARTIAL** |
+| 12. `total_flops_compression` completeness | **PASS** |
 | 13. `acc_servers_highest` semantic correctness | **FAIL (name mismatch)** |
 | 14. Standard config assumptions validated | **PARTIAL** |
 | 15. Intended-vs-actual method faithfulness section provided | **PASS** |

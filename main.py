@@ -774,6 +774,8 @@ def main():
                 "client_compression_flops_round",
                 "server_decompression_flops_round",
                 "client_decompression_flops_round",
+                "total_flops",
+                "total_flops_compression",
                 "acc_servers_highest",
                 "overall_traffic",
                 "upload_traffic",
@@ -865,8 +867,13 @@ def main():
                     finally:
                         for handle in residual_handles:
                             handle.remove()
+                residual_forward_flops = int(residual_flops_state["residual_add_flops"])
+                # PyTorch profiler FLOP coverage is inconsistent for residual add in ResNet blocks.
+                # The hook observes forward residual-add FLOPs only; for local training we mirror
+                # proxy-mode semantics by adding forward + 2*forward as dense backward approximation.
+                residual_training_flops = residual_forward_flops + 2 * residual_forward_flops
                 local_training_flops_accounted_round += (
-                    _sum_profiler_flops(prof) + int(residual_flops_state["residual_add_flops"])
+                    _sum_profiler_flops(prof) + residual_training_flops
                 )
                 state_dict = local_model.state_dict()
             else:
@@ -1181,6 +1188,8 @@ def main():
                     int(client_compression_flops_round),
                     int(server_decompression_flops_round),
                     int(client_decompression_flops_round),
+                    int(total_flops),
+                    int(total_flops_compression),
                     float(report["acc_servers_highest"]),
                     int(overall_traffic),
                     int(upload_traffic),
