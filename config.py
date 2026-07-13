@@ -56,8 +56,11 @@ def get_config():
         "--sparsity_compression",
         type=str,
         default="CSR",
-        choices=["CSR", "bitmask_values", "dense"],
+        choices=["Automatic", "CSR", "bitmask_values", "dense"],
     )
+    parser.add_argument("--automatic_csr_sparsity_threshold", type=float, default=0.90)
+    parser.add_argument("--automatic_bitmask_sparsity_threshold", type=float, default=0.85)
+    parser.add_argument("--automatic_min_tensor_size", type=int, default=1024)
     parser.add_argument(
         "--quantization_bits",
         type=quantization_bits_type,
@@ -89,5 +92,14 @@ def get_config():
     parser.add_argument("--device", type=str, default="cuda")
 
     args = parser.parse_args()
+
+    if not 0.0 <= args.automatic_csr_sparsity_threshold <= 1.0:
+        parser.error("--automatic_csr_sparsity_threshold must be between 0 and 1")
+    if not 0.0 <= args.automatic_bitmask_sparsity_threshold <= 1.0:
+        parser.error("--automatic_bitmask_sparsity_threshold must be between 0 and 1")
+    if args.automatic_bitmask_sparsity_threshold > args.automatic_csr_sparsity_threshold:
+        parser.error("--automatic_bitmask_sparsity_threshold must not be greater than --automatic_csr_sparsity_threshold")
+    if args.automatic_min_tensor_size < 0:
+        parser.error("--automatic_min_tensor_size must not be negative")
 
     return args
