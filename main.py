@@ -17,6 +17,29 @@ from compression import compress_csr, decompress_csr, pack_csr, unpack_csr
 from resnet18 import BasicBlock, ResNet18
 
 
+WANDB_METRIC_ALLOWLIST = (
+    "compression_flops_clients",
+    "decompression_flops_clients",
+    "round_flops",
+    "compression_flops_server",
+    "decompression_flops_server",
+    "acc_servers_highest",
+    "overall_traffic",
+    "upload_traffic",
+    "download_traffic",
+)
+
+
+def filter_wandb_metrics(report):
+    return {key: report[key] for key in WANDB_METRIC_ALLOWLIST if key in report}
+
+
+def log_wandb_metrics(report, **kwargs):
+    wandb_payload = filter_wandb_metrics(report)
+    if wandb_payload:
+        wandb.log(wandb_payload, **kwargs)
+
+
 def estimate_module_forward_flops(module, inputs, output):
     if not torch.is_tensor(output):
         return 0.0
@@ -897,32 +920,32 @@ def main():
     total_round_flops_compression = 0
     total_flops = 0
     num_model_params = int(sum(param.numel() for param in global_model.parameters()))
-    output_dir = "output"
-    os.makedirs(output_dir, exist_ok=True)
-    flops_log_path = os.path.join(output_dir, "round_flops_metrics.csv")
-    with open(flops_log_path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(
-            [
-                "round",
-                "round_flops",
-                "local_training_flops_round",
-                "aggregation_flops_round",
-                "evaluation_flops_round",
-                "serialization_flops_round",
-                "round_flops_compression",
-                "server_compression_flops_round",
-                "client_compression_flops_round",
-                "server_decompression_flops_round",
-                "client_decompression_flops_round",
-                "total_flops",
-                "total_flops_compression",
-                "acc_servers_highest",
-                "overall_traffic",
-                "upload_traffic",
-                "download_traffic",
-            ]
-        )
+    # output_dir = "output"
+    # os.makedirs(output_dir, exist_ok=True)
+    # flops_log_path = os.path.join(output_dir, "round_flops_metrics.csv")
+    # with open(flops_log_path, "w", newline="", encoding="utf-8") as csvfile:
+        # writer = csv.writer(csvfile)
+        # writer.writerow(
+            # [
+                # "round",
+                # "round_flops",
+                # "local_training_flops_round",
+                # "aggregation_flops_round",
+                # "evaluation_flops_round",
+                # "serialization_flops_round",
+                # "round_flops_compression",
+                # "server_compression_flops_round",
+                # "client_compression_flops_round",
+                # "server_decompression_flops_round",
+                # "client_decompression_flops_round",
+                # "total_flops",
+                # "total_flops_compression",
+                # "acc_servers_highest",
+                # "overall_traffic",
+                # "upload_traffic",
+                # "download_traffic",
+            # ]
+        # )
 
     for round_idx in range(args.n_epoch):
         m = max(1, int(args.client_fraction * n_clients))
@@ -1132,7 +1155,7 @@ def main():
             gs_flops_round += metrics.get("gs_flops", 0)
 
             if args.wandb_enabled:
-                wandb.log(
+                log_wandb_metrics(
                     {
                         "client_id": idx,
                         "round": round_idx + 1,
@@ -1341,31 +1364,31 @@ def main():
             report["bitmask_values/numel"] = int(bitmask_numel_round)
 
         if args.wandb_enabled:
-            wandb.log(report, step=round_idx + 1, commit=True)
+            log_wandb_metrics(report, step=round_idx + 1, commit=True)
 
-        with open(flops_log_path, "a", newline="", encoding="utf-8") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(
-                [
-                    round_idx + 1,
-                    int(round_flops),
-                    int(local_training_flops_round),
-                    int(aggregation_flops_round),
-                    int(evaluation_flops_round),
-                    int(serialization_flops_round),
-                    int(round_flops_compression),
-                    int(server_compression_flops_round),
-                    int(client_compression_flops_round),
-                    int(server_decompression_flops_round),
-                    int(client_decompression_flops_round),
-                    int(total_flops),
-                    int(total_flops_compression),
-                    float(report["acc_servers_highest"]),
-                    int(overall_traffic),
-                    int(upload_traffic),
-                    int(download_traffic),
-                ]
-            )
+        # with open(flops_log_path, "a", newline="", encoding="utf-8") as csvfile:
+            # writer = csv.writer(csvfile)
+            # writer.writerow(
+                # [
+                    # round_idx + 1,
+                    # int(round_flops),
+                    # int(local_training_flops_round),
+                    # int(aggregation_flops_round),
+                    # int(evaluation_flops_round),
+                    # int(serialization_flops_round),
+                    # int(round_flops_compression),
+                    # int(server_compression_flops_round),
+                    # int(client_compression_flops_round),
+                    # int(server_decompression_flops_round),
+                    # int(client_decompression_flops_round),
+                    # int(total_flops),
+                    # int(total_flops_compression),
+                    # float(report["acc_servers_highest"]),
+                    # int(overall_traffic),
+                    # int(upload_traffic),
+                    # int(download_traffic),
+                # ]
+            # )
 
         print(f"Round {round_idx + 1}, Clients Acc: {acc_clients}, Server Acc: {acc_servers}")
         cleanup_memory()
