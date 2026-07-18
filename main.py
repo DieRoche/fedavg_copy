@@ -27,6 +27,9 @@ WANDB_METRIC_ALLOWLIST = (
     "overall_traffic",
     "upload_traffic",
     "download_traffic",
+    "client_id",
+    "round",
+    "sparsity",
 )
 
 
@@ -1160,7 +1163,6 @@ def main():
                         "client_id": idx,
                         "round": round_idx + 1,
                         "sparsity": metrics["sparsity"],
-                        "density": metrics["density"],
                     },
                     step=round_idx + 1,
                     commit=False,
