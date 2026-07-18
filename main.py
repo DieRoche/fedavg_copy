@@ -1,6 +1,7 @@
 import copy
 import csv
 import gc
+import io
 import math
 import os
 import random
@@ -187,6 +188,12 @@ def evaluate(model, loader, device, collect_flops=False):
 
 def tensor_dict_bytes(tensor_dict):
     return sum(t.element_size() * t.nelement() for t in tensor_dict.values())
+
+
+def serialized_tensor_dict_bytes(tensor_dict):
+    buffer = io.BytesIO()
+    torch.save({k: v.detach().cpu() for k, v in tensor_dict.items()}, buffer)
+    return len(buffer.getvalue())
 
 
 def compute_upload_traffic_for_round(per_client_upload_bytes):
@@ -1092,6 +1099,9 @@ def main():
             training_loss.append(train_loss)
 
             delta_dict = {k: state_dict[k] - global_state_device[k] for k in param_keys}
+            dense_upload_bytes = None
+            if not args.enable_sparse_masking and args.quantization_bits is None:
+                dense_upload_bytes = serialized_tensor_dict_bytes(delta_dict)
             # Apply Gauss-Southwell masking only for the payload that is transmitted back
             # to the server. The dense delta is kept for local metrics and aggregation
             # bookkeeping.
@@ -1148,6 +1158,8 @@ def main():
                 for key in aggregated_delta.keys():
                     aggregated_delta[key] += reconstructed_state_dict[key] * weight
 
+            if dense_upload_bytes is not None:
+                client_upload_bytes = dense_upload_bytes
             per_client_upload_bytes.append(client_upload_bytes)
 
             metrics.update({"client_id": idx, "round": round_idx + 1})
@@ -1283,7 +1295,7 @@ def main():
         report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
         report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
 
-        model_size_bytes = tensor_dict_bytes(global_state)
+        model_size_bytes = serialized_tensor_dict_bytes(global_state)
         upload_traffic = compute_upload_traffic_for_round(per_client_upload_bytes)
         download_traffic = compute_download_traffic_for_round(model_size_bytes, selected_count)
         overall_traffic = compute_overall_traffic_for_round(upload_traffic, download_traffic)
